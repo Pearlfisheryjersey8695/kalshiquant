@@ -1,0 +1,31 @@
+# Environment and secrets
+.env
+*.pem
+venv/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.cache/
+*.egg-info/
+dist/
+.pytest_cache/
+
+# Generated data artifacts
+data/*.csv
+data/*.parquet
+signals/*.json
+
+# Node
+dashboard/node_modules/
+dashboard/.next/
+
+# OS
+.DS_Store
+Thumbs.db
+NUL
+
+# IDE
+.vscode/
+.idea/
