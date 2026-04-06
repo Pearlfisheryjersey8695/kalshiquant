@@ -4,6 +4,7 @@ Maintains per-market yes/no books (price_cents -> quantity).
 """
 
 import logging
+import time
 
 logger = logging.getLogger("kalshi.orderbook")
 
@@ -17,6 +18,7 @@ class Orderbook:
         self.no: dict[int, int] = {}    # price_cents -> qty
         self._seq: int = -1
         self._has_snapshot = False
+        self._last_update_ts: float = 0.0
 
     def apply_snapshot(self, msg: dict, seq: int) -> None:
         """Replace entire book from orderbook_snapshot message."""
@@ -30,6 +32,7 @@ class Orderbook:
                 self.no[price] = qty
         self._seq = seq
         self._has_snapshot = True
+        self._last_update_ts = time.time()
 
     def apply_delta(self, msg: dict, seq: int) -> bool:
         """
@@ -58,6 +61,7 @@ class Orderbook:
         else:
             book[price] = new_qty
 
+        self._last_update_ts = time.time()
         return True
 
     def get_mid_price_cents(self) -> float:
@@ -195,6 +199,23 @@ class Orderbook:
         }
 
     @property
+    def age_seconds(self) -> float:
+        """Seconds since last update."""
+        if self._last_update_ts == 0:
+            return float('inf')
+        return time.time() - self._last_update_ts
+
+    @property
+    def is_stale(self) -> bool:
+        """True if no update in > 60 seconds."""
+        return self.age_seconds > 60
+
+    @property
+    def is_dead(self) -> bool:
+        """True if no update in > 300 seconds."""
+        return self.age_seconds > 300
+
+    @property
     def has_data(self) -> bool:
         return self._has_snapshot
 
@@ -221,6 +242,21 @@ class OrderbookStore:
         """Mark all orderbooks as stale (e.g. after WS disconnect)."""
         for ob in self._books.values():
             ob._has_snapshot = False
+
+    def get_health_report(self) -> dict:
+        """Get staleness report for all orderbooks."""
+        report = {"total": 0, "fresh": 0, "stale": 0, "dead": 0, "books": {}}
+        for ticker, ob in self._books.items():
+            report["total"] += 1
+            age = ob.age_seconds
+            status = "fresh" if age < 60 else "stale" if age < 300 else "dead"
+            report[status] += 1
+            report["books"][ticker] = {
+                "age_seconds": round(age, 1),
+                "status": status,
+                "has_snapshot": ob._has_snapshot,
+            }
+        return report
 
     def all_tickers(self) -> list[str]:
         return list(self._books.keys())

@@ -16,8 +16,8 @@ import requests as req
 RETRY = 3
 # ── Filter thresholds ────────────────────────────────────────────────────
 MIN_VOLUME = 100
-MAX_SPREAD_CENTS = 10
-MIN_DEPTH_DOLLARS = 500      # total $ within 5c of mid, both sides
+MAX_SPREAD_CENTS = 15
+MIN_DEPTH_DOLLARS = 200      # total $ within 5c of mid, both sides
 MIN_OPEN_INTEREST = 50
 MIN_HOURS_TO_EXP = 2
 MAX_HOURS_TO_EXP = 90 * 24   # 90 days
@@ -41,26 +41,28 @@ def fetch_orderbook(client, ticker, depth=20):
 
 def calc_depth(orderbook, mid_price, band_cents=5):
     """
-    Calculate total dollar depth within `band_cents` of mid on both sides.
+    Calculate depth within band_cents of mid, requiring BOTH sides.
     Orderbook format: {"yes": [[price, qty], ...], "no": [[price, qty], ...]}
     Prices are in cents, qty in contracts. Each contract is $1 notional.
     No-side prices are in complementary space (100 - yes_price).
+    Returns (total_depth, yes_depth, no_depth).
     """
-    total_depth = 0.0
+    yes_depth = 0.0
+    no_depth = 0.0
 
     # Yes side: compare directly against yes mid
     for price, qty in orderbook.get("yes", []):
         if abs(price - mid_price) <= band_cents:
-            total_depth += qty * (price / 100.0)
+            yes_depth += qty * (price / 100.0)
 
     # No side: prices are in complementary space, so compare
     # against no_mid = 100 - yes_mid
     no_mid = 100 - mid_price
     for price, qty in orderbook.get("no", []):
         if abs(price - no_mid) <= band_cents:
-            total_depth += qty * (price / 100.0)
+            no_depth += qty * (price / 100.0)
 
-    return total_depth
+    return yes_depth + no_depth, yes_depth, no_depth
 
 
 def main():
@@ -130,8 +132,8 @@ def main():
             continue
 
         mid = (row["yes_bid"] + row["yes_ask"]) / 2.0
-        d = calc_depth(ob, mid, band_cents=5)
-        depths.append(d)
+        total_d, yes_d, no_d = calc_depth(ob, mid, band_cents=5)
+        depths.append(total_d)
 
         if (i + 1) % 25 == 0:
             print(f"    {i+1}/{len(df)} fetched ...")
@@ -142,6 +144,19 @@ def main():
     passed = df[~thin].copy()
     failed_depth = df[thin].copy()
     print(f"  Depth >= ${MIN_DEPTH_DOLLARS}: {len(passed):,} remain ({len(failed_depth):,} cut)")
+
+    # ── Event deduplication: max 3 markets per event ────────────────
+    MAX_PER_EVENT = 3
+    if "event_ticker" in passed.columns:
+        deduped = []
+        for event, grp in passed.groupby("event_ticker"):
+            if len(grp) > MAX_PER_EVENT:
+                deduped.append(grp.nlargest(MAX_PER_EVENT, "volume"))
+            else:
+                deduped.append(grp)
+        if deduped:
+            passed = pd.concat(deduped)
+        print(f"  Event dedup (max {MAX_PER_EVENT}/event): {len(passed)} remain")
 
     # ── Outputs ──────────────────────────────────────────────────────────
     # 1. Tradeable markets

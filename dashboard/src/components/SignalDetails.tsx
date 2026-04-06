@@ -243,7 +243,25 @@ export default function SignalDetails() {
         <div className="grid grid-cols-2 gap-x-4 gap-y-1.5 text-[10px]">
           <div className="flex justify-between">
             <span className="text-text-secondary">Strategy</span>
-            <span className="font-mono">{signal.strategy}</span>
+            <span
+              className="font-mono font-semibold px-1 py-0.5 rounded text-[9px]"
+              style={{
+                background:
+                  signal.strategy === "momentum" ? "rgba(245,158,11,0.2)" :
+                  signal.strategy === "mean_reversion" ? "rgba(0,210,106,0.2)" :
+                  signal.strategy === "event_driven" ? "rgba(168,85,247,0.2)" :
+                  signal.strategy === "convergence" ? "rgba(59,130,246,0.2)" :
+                  "rgba(136,136,153,0.2)",
+                color:
+                  signal.strategy === "momentum" ? "#f59e0b" :
+                  signal.strategy === "mean_reversion" ? "#00d26a" :
+                  signal.strategy === "event_driven" ? "#a855f7" :
+                  signal.strategy === "convergence" ? "#3b82f6" :
+                  "#888899",
+              }}
+            >
+              {signal.strategy}
+            </span>
           </div>
           <div className="flex justify-between">
             <span className="text-text-secondary">Prediction 1h</span>
@@ -308,7 +326,7 @@ export default function SignalDetails() {
                   <span className="w-1.5 h-1.5 rounded-sm inline-block" style={{
                     background: name === "base_rate" ? "#3b82f6" : name === "orderbook" ? "#00d26a" : name === "cross_market" ? "#f59e0b" : name === "time_decay" ? "#a855f7" : "#06b6d4",
                   }} />
-                  <span className="font-mono">{name.slice(0, 5)} {(w * 100).toFixed(0)}%</span>
+                  <span className="font-mono">{({base_rate:"Base",orderbook:"OB",cross_market:"Cross",time_decay:"Decay",sentiment:"Sent"} as Record<string,string>)[name] ?? name} {(w * 100).toFixed(0)}%</span>
                 </div>
               ))}
             </div>

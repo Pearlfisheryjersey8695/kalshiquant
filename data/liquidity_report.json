@@ -1,39 +1,39 @@
 {
-  "timestamp": "2026-03-03T20:49:26.352418+00:00",
-  "universe_size": 32014,
+  "timestamp": "2026-04-01T00:20:49.052842+00:00",
+  "universe_size": 4000,
   "filter_pipeline": [
     {
       "filter": "volume >= 100",
-      "remaining": 11376,
-      "cut": 20638
+      "remaining": 239,
+      "cut": 3761
     },
     {
       "filter": "open_interest >= 50",
-      "remaining": 11292,
-      "cut": 84
+      "remaining": 239,
+      "cut": 0
     },
     {
       "filter": "expiry 2h-90d",
-      "remaining": 6813,
-      "cut": 4479
+      "remaining": 239,
+      "cut": 0
     },
     {
-      "filter": "spread <= 10c",
-      "remaining": 155,
-      "cut": 6658
+      "filter": "spread <= 15c",
+      "remaining": 0,
+      "cut": 239
     },
     {
-      "filter": "depth >= $500",
-      "remaining": 51,
-      "cut": 104
+      "filter": "depth >= $200",
+      "remaining": 0,
+      "cut": 0
     }
   ],
-  "tradeable_count": 51,
-  "rejection_rate_pct": 99.84,
+  "tradeable_count": 0,
+  "rejection_rate_pct": 100.0,
   "tradeable_stats": {
-    "mean_volume": 18296.0,
-    "median_volume": 784.0,
-    "mean_spread": 2.3,
-    "mean_depth_dollars": 12329.0
+    "mean_volume": 0,
+    "median_volume": 0,
+    "mean_spread": 0,
+    "mean_depth_dollars": 0
   }
 }

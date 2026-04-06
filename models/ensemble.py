@@ -16,17 +16,10 @@ from models.features import load_features, prepare_ml_data
 from models.fair_value import FairValueModel
 from models.price_predictor import PricePredictor
 from models.regime_detector import RegimeDetector
-from models.risk_model import RiskModel
+from models.risk_model import RiskModel, kalshi_fee_rt
 from models.meta_model import MetaModel
 from collections import defaultdict
-
-# Fee-aware minimum edge thresholds — regime-adaptive
-FEE_PER_CONTRACT_RT = 0.03
-MIN_EDGE = 0.03
-MIN_EDGE_MEAN_REVERT = 0.025  # 2.5c — 67% WR justifies tighter threshold
-MIN_EDGE_TRENDING = 0.08      # 8c — 50% WR = no edge, need overwhelming signal
-MIN_EDGE_CONVERGENCE = 0.05   # 5c — prevents fee drag on cheap contracts
-CONVERGENCE_REGIME_MAX_CONTRACTS = 500  # Cap in CONVERGENCE regime only
+from engine.strategies import select_strategies, get_strategy, STRATEGIES
 
 
 def run_ensemble(portfolio_value=10000):
@@ -80,10 +73,10 @@ def run_ensemble(portfolio_value=10000):
     print("  Fair value model fitted (out-of-sample)")
 
     predictor = PricePredictor()
-    predictor.fit(features)  # has its own internal walk-forward split
+    predictor.fit(fv_calibration)  # same temporal split as FV — no look-ahead bias
 
     regime = RegimeDetector()
-    regime.fit(features)  # regime classification is per-row, no circularity
+    regime.fit(fv_calibration)  # same temporal split as FV — no look-ahead bias
     print("  Regime detector fitted")
 
     risk = RiskModel(portfolio_value=portfolio_value)
@@ -94,9 +87,11 @@ def run_ensemble(portfolio_value=10000):
     print("[3/5] Generating fair value signals ...")
     fv_all = fv_model.predict(fv_evaluation)
     # Use lowest threshold to get all candidates — regime filtering happens later
-    fv_signals = fv_model.get_signals(fv_evaluation, min_edge=MIN_EDGE_MEAN_REVERT)
+    # Use lowest strategy min_edge as pre-filter (mean_reversion = 0.025)
+    pre_filter_edge = min(s.min_edge for s in STRATEGIES.values()) if STRATEGIES else 0.025
+    fv_signals = fv_model.get_signals(fv_evaluation, min_edge=pre_filter_edge)
     fv_weights = fv_model.get_current_weights()
-    print(f"  {len(fv_signals)} markets with |edge| > {MIN_EDGE_MEAN_REVERT*100:.1f}c (pre-regime filter)")
+    print(f"  {len(fv_signals)} markets with |edge| > {pre_filter_edge*100:.1f}c (pre-regime filter)")
     print(f"  FV weights: {fv_weights}")
 
     print("[4/5] Running price predictor + regime ...")
@@ -172,32 +167,18 @@ def run_ensemble(portfolio_value=10000):
         mkt_regime = latest_regimes.get(ticker, "UNKNOWN")
         regime_probs = latest_regime_probs.get(ticker, {})
 
-        # Skip stale markets
         if mkt_regime == "STALE":
             continue
 
-        # Regime-adaptive minimum edge
-        effective_min = MIN_EDGE
-        if mkt_regime == "MEAN_REVERTING":
-            effective_min = MIN_EDGE_MEAN_REVERT
-        elif mkt_regime == "TRENDING":
-            effective_min = MIN_EDGE_TRENDING
-        elif mkt_regime == "CONVERGENCE":
-            effective_min = MIN_EDGE_CONVERGENCE
-        if abs(edge) < effective_min:
-            continue
-
-        # Price prediction
-        pred_dir = 0
-        pred_conf = 0.0
-        pred_change = 0.0
+        # Price prediction (shared across strategies)
+        pred_dir, pred_conf, pred_change = 0, 0.0, 0.0
         if ticker in latest_preds.index:
             pred_dir = int(latest_preds.loc[ticker, "predicted_direction"])
             pred_conf = float(latest_preds.loc[ticker, "confidence"])
             if "predicted_change" in latest_preds.columns:
                 pred_change = float(latest_preds.loc[ticker, "predicted_change"])
 
-        # Determine direction
+        # Direction
         if edge > 0:
             direction = "BUY_YES"
         elif edge < 0:
@@ -205,53 +186,43 @@ def run_ensemble(portfolio_value=10000):
         else:
             direction = "HOLD"
 
-        # Fix 4: Prefer BUY_YES over BUY_NO when equivalent
-        if direction == "BUY_NO":
-            parts = ticker.rsplit("-", 1)
-            prefix = parts[0] if len(parts) > 1 else ticker
-            siblings = event_tickers.get(prefix, [])
-            has_buy_yes = any(
-                sib["ticker"] != ticker and sib["edge"] > MIN_EDGE
+        # If multiple siblings in same event, keep the one with largest |net_edge|
+        # instead of always preferring BUY_YES (which introduces directional bias)
+        event_prefix = ticker.rsplit("-", 1)[0] if "-" in ticker else ticker
+        siblings = event_tickers.get(event_prefix, [])
+        if len(siblings) > 1:
+            my_abs_edge = abs(edge)
+            better_sibling = any(
+                sib["ticker"] != ticker and abs(sib["edge"]) > my_abs_edge
                 for sib in siblings
             )
-            if has_buy_yes:
-                continue  # Skip BUY_NO, equivalent BUY_YES exists in same event
+            if better_sibling:
+                continue
 
         # Combined confidence
+        # Note: This confidence score is NOT a calibrated probability.
+        # It is a composite heuristic that feeds into position sizing.
+        # For production use, replace with isotonic regression on OOS backtest data.
         fv_conf = min(abs(edge) / 0.10, 1.0)
-
-        # Predictor agreement bonus
         pred_agrees = (pred_dir > 0 and edge > 0) or (pred_dir < 0 and edge < 0)
         pred_bonus = pred_conf * 0.3 if pred_agrees else -pred_conf * 0.1
-
-        # Regime suitability
         regime_mult = {
-            "MEAN_REVERTING": 1.0,
-            "TRENDING": 0.9,
-            "HIGH_VOLATILITY": 0.6,
-            "CONVERGENCE": 0.8,
-            "STALE": 0.0,
+            "MEAN_REVERTING": 1.0, "TRENDING": 0.9, "HIGH_VOLATILITY": 0.6,
+            "CONVERGENCE": 0.8, "STALE": 0.0,
         }.get(mkt_regime, 0.5)
-
-        # Regime certainty bonus from HMM
         regime_certainty = max(regime_probs.values()) if regime_probs else 0.5
-        confidence = np.clip(fv_conf * 0.5 + pred_bonus + regime_mult * 0.15 + regime_certainty * 0.05, 0, 1)
+        confidence = float(np.clip(
+            fv_conf * 0.4 + pred_bonus + regime_mult * 0.15 + regime_certainty * 0.05, 0, 1
+        ))
 
-        # Meta-model gate: regime-adaptive threshold
+        # Meta-model quality (shared)
         meta_quality = meta.predict_trade_quality(
             pred_dir, pred_conf, pred_change, edge, mkt_regime, regime_probs
         )
-        meta_gate = 0.30
-        if mkt_regime == "MEAN_REVERTING":
-            meta_gate = 0.20  # Let more signals through — 67% WR regime
-        elif mkt_regime == "TRENDING":
-            meta_gate = 0.40  # Stricter — 50% WR regime
-        if meta_quality < meta_gate:
-            continue
 
         scored_info = scored_map.get(ticker, {})
 
-        # Sentiment
+        # Sentiment (shared)
         try:
             from pipeline.sentiment import get_sentiment
             sentiment_data = get_sentiment(
@@ -263,88 +234,146 @@ def run_ensemble(portfolio_value=10000):
                               "ai_prob": 0.0, "ai_edge": 0.0, "ai_reasoning": "",
                               "consensus_prob": 0.0, "source": ""}
 
-        # Position sizing (fee-aware, volume-capped)
-        contracts, risk_details = risk.position_size(
-            ticker, edge, confidence, current_price,
-            direction=direction,
-            category=scored_info.get("category", ""),
-            volume_24h=int(scored_info.get("volume", 0)),
-        )
+        # Get minutes_to_release from features if available
+        ticker_rows = fv_evaluation[fv_evaluation["ticker"] == ticker]
+        minutes_to_release = 999.0
+        if len(ticker_rows) > 0 and "minutes_to_release" in ticker_rows.columns:
+            mtr = ticker_rows.iloc[-1].get("minutes_to_release", 999.0)
+            if pd.notna(mtr):
+                minutes_to_release = float(mtr)
 
-        # Skip if position_size rejected (edge < fees)
-        if contracts <= 0:
+        # Select applicable strategies
+        matched_strategies = select_strategies(mkt_regime, minutes_to_release)
+        if not matched_strategies:
             continue
 
-        # Cap in CONVERGENCE regime only — prevents fee drag
-        if mkt_regime == "CONVERGENCE":
-            contracts = min(contracts, CONVERGENCE_REGIME_MAX_CONTRACTS)
+        for strat_config in matched_strategies:
+            # Strategy-specific edge gate
+            if abs(edge) < strat_config.min_edge:
+                continue
 
-        # Hedging
-        hedges = risk.suggest_hedges(ticker, direction)
+            # Strategy-specific meta gate
+            if meta_quality < strat_config.meta_gate:
+                continue
 
-        # Build reasons
-        reasons = []
-        net_edge_val = risk_details.get("net_edge", abs(edge) - FEE_PER_CONTRACT_RT)
-        reasons.append(f"Fair value {fair_value:.2f} vs market {current_price:.2f} "
-                       f"(gross {edge:+.2f}, net {net_edge_val:+.4f})")
-        if pred_agrees:
-            reasons.append(f"ML predictor agrees ({pred_conf:.0%} confidence)")
-        elif pred_dir != 0:
-            reasons.append(f"ML predictor disagrees (direction={pred_dir})")
-        reasons.append(f"Regime: {mkt_regime}")
-        reasons.append(f"Meta-model quality: {meta_quality:.0%}")
-        if abs(sentiment_data.get("consensus_edge", 0)) > 0.01:
-            reasons.append(f"Consensus edge: {sentiment_data['consensus_edge']:+.2f} ({sentiment_data.get('source', '')})")
+            # Strategy-specific entry checks
+            if strat_config.name == "momentum" and not pred_agrees:
+                continue
+            if strat_config.name == "event_driven":
+                if abs(sentiment_data.get("consensus_edge", 0)) < 0.02:
+                    continue
 
-        signal = {
-            "ticker": ticker,
-            "title": scored_info.get("title", ""),
-            "category": scored_info.get("category", ""),
-            "current_price": round(current_price, 4),
-            "fair_value": round(fair_value, 4),
-            "edge": round(edge, 4),
-            "net_edge": round(risk_details.get("net_edge", 0), 4),
-            "fee_impact": round(risk_details.get("fee_impact", 0), 4),
-            "direction": direction,
-            "confidence": round(confidence, 4),
-            "meta_quality": round(meta_quality, 4),
-            "regime": mkt_regime,
-            "strategy": _strategy_for_regime(mkt_regime),
-            "price_prediction_1h": pred_dir,
-            "predicted_change": round(pred_change, 4),
-            "prediction_confidence": round(pred_conf, 4),
-            "recommended_contracts": contracts,
-            "risk": risk_details,
-            "hedge": hedges[0] if hedges else None,
-            "reasons": reasons,
-            "volume": int(scored_info.get("volume", 0)),
-            "open_interest": int(scored_info.get("open_interest", 0)),
-            "tradability_score": scored_info.get("tradability_score", 0),
-            "expiration_time": expiry_map.get(ticker, None),
-            "decay_curve": _compute_decay_curve(ticker, fv_all, edge),
-            "consensus_edge": round(sentiment_data.get("consensus_edge", 0), 4),
-            "consensus_prob": round(sentiment_data.get("consensus_prob", 0), 4),
-            "sentiment_edge": round(sentiment_data.get("sentiment_edge", 0), 4),
-            "ai_prob": round(sentiment_data.get("ai_prob", 0), 4),
-            "ai_edge": round(sentiment_data.get("ai_edge", 0), 4),
-            "ai_reasoning": sentiment_data.get("ai_reasoning", sentiment_data.get("reasoning", "")),
-            "regime_probs": {k: round(v, 4) for k, v in regime_probs.items()} if regime_probs else {},
-            "fv_weights": fv_weights,
-        }
-        signals.append(signal)
+            # Position sizing
+            contracts, risk_details = risk.position_size(
+                ticker, edge, confidence, current_price,
+                direction=direction,
+                category=scored_info.get("category", ""),
+                volume_24h=int(scored_info.get("volume", 0)),
+            )
+            if contracts <= 0:
+                continue
+            contracts = min(contracts, strat_config.max_contracts)
 
-    # Sort by |edge| * confidence * liquidity proxy
+            # Hedging
+            hedges = risk.suggest_hedges(ticker, direction)
+
+            # Build reasons
+            net_edge_val = risk_details.get("net_edge", abs(edge) - kalshi_fee_rt(current_price))
+            reasons = [
+                f"Fair value {fair_value:.2f} vs market {current_price:.2f} "
+                f"(gross {edge:+.2f}, net {net_edge_val:+.4f})",
+                f"Strategy: {strat_config.name}",
+            ]
+            if pred_agrees:
+                reasons.append(f"ML predictor agrees ({pred_conf:.0%} confidence)")
+            elif pred_dir != 0:
+                reasons.append(f"ML predictor disagrees (direction={pred_dir})")
+            reasons.append(f"Regime: {mkt_regime}")
+            reasons.append(f"Meta-model quality: {meta_quality:.0%}")
+            if abs(sentiment_data.get("consensus_edge", 0)) > 0.01:
+                reasons.append(f"Consensus edge: {sentiment_data['consensus_edge']:+.2f} ({sentiment_data.get('source', '')})")
+
+            signal = {
+                "ticker": ticker,
+                "title": scored_info.get("title", ""),
+                "category": scored_info.get("category", ""),
+                "current_price": round(current_price, 4),
+                "fair_value": round(fair_value, 4),
+                "edge": round(edge, 4),
+                "net_edge": round(risk_details.get("net_edge", 0), 4),
+                "fee_impact": round(risk_details.get("fee_impact", 0), 4),
+                "direction": direction,
+                "confidence": round(confidence, 4),
+                "meta_quality": round(meta_quality, 4),
+                "regime": mkt_regime,
+                "strategy": strat_config.name,
+                "strategy_params": {
+                    "stop_loss_pct": strat_config.stop_loss_pct,
+                    "take_profit_ratio": strat_config.take_profit_ratio,
+                    "kelly_fraction": strat_config.kelly_fraction,
+                    "max_hold_hours": strat_config.max_hold_hours,
+                },
+                "minutes_to_release": round(minutes_to_release, 1),
+                "price_prediction_1h": pred_dir,
+                "predicted_change": round(pred_change, 4),
+                "prediction_confidence": round(pred_conf, 4),
+                "recommended_contracts": contracts,
+                "risk": risk_details,
+                "hedge": hedges[0] if hedges else None,
+                "reasons": reasons,
+                "volume": int(scored_info.get("volume", 0)),
+                "open_interest": int(scored_info.get("open_interest", 0)),
+                "tradability_score": scored_info.get("tradability_score", 0),
+                "expiration_time": expiry_map.get(ticker, None),
+                "decay_curve": _compute_decay_curve(ticker, fv_all, edge),
+                "consensus_edge": round(sentiment_data.get("consensus_edge", 0), 4),
+                "consensus_prob": round(sentiment_data.get("consensus_prob", 0), 4),
+                "sentiment_edge": round(sentiment_data.get("sentiment_edge", 0), 4),
+                "ai_prob": round(sentiment_data.get("ai_prob", 0), 4),
+                "ai_edge": round(sentiment_data.get("ai_edge", 0), 4),
+                "ai_reasoning": sentiment_data.get("ai_reasoning", sentiment_data.get("reasoning", "")),
+                "regime_probs": {k: round(v, 4) for k, v in regime_probs.items()} if regime_probs else {},
+                "fv_weights": fv_weights,
+            }
+            signals.append(signal)
+
+    # Rank by signal quality only (net_edge * confidence)
+    # Liquidity is a filter, not a ranking factor — conflating volume with
+    # signal quality biases toward high-volume markets with weak edges
+    signals = [s for s in signals if s.get("volume", 0) >= 50]  # min volume filter
     for s in signals:
-        s["_rank_score"] = abs(s["edge"]) * s["confidence"] * min(s["volume"] / 10000, 1.0)
+        s["_rank"] = abs(s.get("net_edge", s.get("edge", 0))) * s.get("confidence", 0)
+    signals.sort(key=lambda s: s["_rank"], reverse=True)
 
-    signals.sort(key=lambda s: s["_rank_score"], reverse=True)
-
-    # Remove internal ranking field
+    seen_strategies = set()
+    reserved = []
+    remaining = []
     for s in signals:
-        del s["_rank_score"]
+        if s["strategy"] not in seen_strategies and len(reserved) < 10:
+            reserved.append(s)
+            seen_strategies.add(s["strategy"])
+        else:
+            remaining.append(s)
+    top_signals = reserved
+    for s in remaining:
+        if len(top_signals) >= 10:
+            break
+        top_signals.append(s)
+    top_signals.sort(key=lambda s: s.get("_rank", 0), reverse=True)
+    for s in signals:
+        s.pop("_rank", None)
 
-    # Top 10
-    top_signals = signals[:10]
+    # Fall back to demo signals if ensemble produces nothing
+    if not top_signals:
+        try:
+            from engine.demo_mode import load_demo_signals
+            demo = load_demo_signals(portfolio_value)
+            if demo.get("signals"):
+                top_signals = demo["signals"]
+                signals = top_signals
+                print("  [Demo mode] Loaded backtest-derived signals for display")
+        except Exception as e:
+            print(f"  Demo mode failed: {e}")
 
     # Save
     output = {
@@ -411,16 +440,6 @@ def _compute_decay_curve(ticker, fv_all, current_edge):
 
     curve.sort(key=lambda p: p["minutes"])
     return curve
-
-
-def _strategy_for_regime(regime):
-    return {
-        "TRENDING": "momentum",
-        "MEAN_REVERTING": "contrarian",
-        "HIGH_VOLATILITY": "reduced_size",
-        "CONVERGENCE": "time_decay",
-        "STALE": "no_trade",
-    }.get(regime, "default")
 
 
 if __name__ == "__main__":

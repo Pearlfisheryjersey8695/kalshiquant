@@ -15,6 +15,7 @@ export default function MarketScanner() {
   const [sortKey, setSortKey] = useState<SortKey>("edge");
   const [sortDir, setSortDir] = useState<SortDir>("desc");
   const [filter, setFilter] = useState("");
+  const [stratFilter, setStratFilter] = useState<string>("all");
   const prevPrices = useRef<Map<string, number>>(new Map());
   const [flashMap, setFlashMap] = useState<Map<string, "green" | "red">>(new Map());
   const [arbTickers, setArbTickers] = useState<Set<string>>(new Set());
@@ -52,6 +53,7 @@ export default function MarketScanner() {
     if (newFlashes.size > 0) {
       setFlashMap(newFlashes);
       const timer = setTimeout(() => setFlashMap(new Map()), 600);
+      prevPrices.current = new Map(markets.map((m) => [m.ticker, m.price]));
       return () => clearTimeout(timer);
     }
     prevPrices.current = new Map(markets.map((m) => [m.ticker, m.price]));
@@ -69,6 +71,12 @@ export default function MarketScanner() {
           m.category.toLowerCase().includes(q)
       );
     }
+    if (stratFilter !== "all") {
+      const stratTickers = new Set(
+        signals.filter((s) => s.strategy === stratFilter).map((s) => s.ticker)
+      );
+      filtered = filtered.filter((m) => stratTickers.has(m.ticker));
+    }
 
     return [...filtered].sort((a, b) => {
       let va: number, vb: number;
@@ -85,7 +93,7 @@ export default function MarketScanner() {
       }
       return sortDir === "asc" ? va - vb : vb - va;
     });
-  }, [markets, signalMap, filter, sortKey, sortDir]);
+  }, [markets, signals, signalMap, filter, stratFilter, sortKey, sortDir]);
 
   function toggleSort(key: SortKey) {
     if (sortKey === key) setSortDir((d) => (d === "asc" ? "desc" : "asc"));
@@ -106,13 +114,26 @@ export default function MarketScanner() {
         title="Market Scanner"
         subtitle={`${sorted.length} markets`}
         right={
-          <input
-            type="text"
-            placeholder="Search..."
-            value={filter}
-            onChange={(e) => setFilter(e.target.value)}
-            className="bg-bg border border-border rounded px-2 py-0.5 text-[10px] text-text-primary w-28 focus:outline-none focus:border-blue"
-          />
+          <div className="flex items-center gap-1">
+            <select
+              value={stratFilter}
+              onChange={(e) => setStratFilter(e.target.value)}
+              className="bg-bg border border-border rounded px-1 py-0.5 text-[10px] text-text-primary focus:outline-none focus:border-blue"
+            >
+              <option value="all">All</option>
+              <option value="convergence">Convergence</option>
+              <option value="momentum">Momentum</option>
+              <option value="mean_reversion">Mean Rev</option>
+              <option value="event_driven">Event</option>
+            </select>
+            <input
+              type="text"
+              placeholder="Search..."
+              value={filter}
+              onChange={(e) => setFilter(e.target.value)}
+              className="bg-bg border border-border rounded px-2 py-0.5 text-[10px] text-text-primary w-24 focus:outline-none focus:border-blue"
+            />
+          </div>
         }
       />
       <div className="flex-1 overflow-y-auto min-h-0">

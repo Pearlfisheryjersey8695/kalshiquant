@@ -27,11 +27,12 @@ class FairValueModel(BaseModel):
     name = "fair_value"
 
     def __init__(self):
-        # Initial weights (will be adapted after enough data)
-        self._weights = np.array([0.30, 0.20, 0.15, 0.20, 0.15])
+        # Initial weights — external base rate is PRIMARY alpha source
+        self._weights = np.array([0.50, 0.15, 0.10, 0.15, 0.10])
         self._base_rates = {}   # ticker -> rolling mean price
         self._cross_corr = {}   # (ticker_a, ticker_b) -> correlation
         self._scored_map = {}   # ticker -> {title, category}
+        self._expiry_map = {}   # ticker -> expiration_time string
 
         # Adaptive weight tracking
         self._error_history: dict[str, list[float]] = {n: [] for n in COMPONENT_NAMES}
@@ -126,11 +127,11 @@ class FairValueModel(BaseModel):
         # Smooth transition: blend 70% new + 30% old to prevent wild swings
         blended = 0.7 * new_weights + 0.3 * self._weights
 
-        # Component-specific floors: edge-generators (base_rate, sentiment) get
-        # higher floors because they're the only source of alpha. Price-trackers
-        # (orderbook, cross_market) are accurate but generate zero edge.
+        # Component-specific floors: external base_rate is PRIMARY alpha source.
+        # Sentiment is secondary. Price-trackers (orderbook, cross_market)
+        # are accurate but generate zero edge.
         # [base_rate, orderbook, cross_market, time_decay, sentiment]
-        FLOORS = np.array([0.15, 0.05, 0.05, 0.10, 0.15])
+        FLOORS = np.array([0.25, 0.05, 0.05, 0.10, 0.05])
         blended = np.maximum(blended, FLOORS)
         self._weights = blended / blended.sum()
 
@@ -140,6 +141,26 @@ class FairValueModel(BaseModel):
     # ── Component signals ──────────────────────────────────────────────────
 
     def _base_rate_signal(self, ticker, current_price):
+        """Base rate from EXTERNAL data — the core alpha source."""
+        # Try external feed first
+        from data.external_feeds import feed_manager
+
+        # Get hours to expiry (needed for probability model)
+        hours_to_expiry = 999
+        exp_time = self._expiry_map.get(ticker, "")
+        if exp_time:
+            try:
+                from datetime import datetime, timezone
+                exp = datetime.fromisoformat(str(exp_time).replace("Z", "+00:00"))
+                hours_to_expiry = max(0, (exp - datetime.now(timezone.utc)).total_seconds() / 3600)
+            except Exception:
+                pass
+
+        ext_result = feed_manager.get_probability_for_ticker(ticker, current_price, hours_to_expiry)
+        if ext_result and not ext_result.get("stale", True):
+            return ext_result["probability"]
+
+        # Fallback: historical base rate (weak signal, not alpha)
         return self._base_rates.get(ticker, current_price)
 
     def _orderbook_signal(self, row):

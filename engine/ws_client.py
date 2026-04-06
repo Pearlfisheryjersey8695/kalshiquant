@@ -106,6 +106,8 @@ class KalshiWSClient:
             if ticker:
                 ob = self._orderbooks.get_or_create(ticker)
                 ob.apply_snapshot(msg, seq)
+                # Also derive price from orderbook snapshot (ticker msgs may not arrive)
+                self._update_price_from_orderbook(ticker, ob)
 
         elif msg_type == "orderbook_delta":
             ticker = msg.get("market_ticker", "")
@@ -113,9 +115,17 @@ class KalshiWSClient:
                 ob = self._orderbooks.get_or_create(ticker)
                 ok = ob.apply_delta(msg, seq)
                 if not ok:
-                    # Seq gap — need to resubscribe for fresh snapshot
                     logger.warning("Orderbook seq gap for %s, resubscribing", ticker)
                     await self._subscribe([ticker], ["orderbook_delta"])
+                else:
+                    # Update price from orderbook after each delta
+                    self._update_price_from_orderbook(ticker, ob)
+
+        elif msg_type == "trade":
+            # Kalshi v2 may send trade messages — extract price
+            ticker = msg.get("market_ticker", "")
+            if ticker:
+                self._state.update_from_ticker_msg(msg)
 
         elif msg_type == "error":
             logger.error("WS error: %s", msg)
@@ -124,7 +134,30 @@ class KalshiWSClient:
                 message=f"WS error: {msg}",
             )
 
-        # Ignore other types (subscribed confirmations, etc.)
+        # Log unknown types for debugging (first 5 only)
+        elif msg_type and msg_type not in ("subscribed", ""):
+            if not hasattr(self, '_logged_types'):
+                self._logged_types = set()
+            if msg_type not in self._logged_types and len(self._logged_types) < 5:
+                self._logged_types.add(msg_type)
+                logger.info("Unknown WS msg type '%s': %s", msg_type, str(msg)[:200])
+
+    def _update_price_from_orderbook(self, ticker: str, ob) -> None:
+        """Derive market price from orderbook bid/ask when ticker msgs don't arrive."""
+        if not ob._has_snapshot:
+            return
+        try:
+            mid_cents = ob.get_mid_price_cents()
+            if mid_cents > 0:
+                price = mid_cents / 100.0
+                self._state.update_from_ticker_msg({
+                    "market_ticker": ticker,
+                    "price": mid_cents,
+                    "yes_bid": mid_cents - 1 if mid_cents > 1 else 0,
+                    "yes_ask": mid_cents + 1 if mid_cents < 100 else 100,
+                })
+        except Exception:
+            pass
 
     async def connect_and_run(self) -> None:
         """Main async loop: connect, subscribe, receive messages. Auto-reconnects."""

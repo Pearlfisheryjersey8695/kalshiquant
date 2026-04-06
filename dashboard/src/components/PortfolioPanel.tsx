@@ -1,46 +1,52 @@
 "use client";
 
 import { useDashboard } from "@/lib/store";
-import { fmtPrice, fmtDollar, fmtRelativeTime } from "@/lib/format";
+import { fmtPrice, fmtDollar } from "@/lib/format";
 import PanelHeader from "./PanelHeader";
 import { useMemo } from "react";
 
 const DONUT_COLORS = ["#3b82f6", "#00d26a", "#f59e0b", "#ff3b3b", "#a855f7", "#06b6d4"];
 
 export default function PortfolioPanel() {
-  const { simCash, simTrades, signals, markets, executeTrade } = useDashboard();
+  const { openPositions, positionSummary, signals, markets } = useDashboard();
 
-  const totalDeployed = simTrades.reduce((sum, t) => sum + t.sizeDollars, 0);
-  const totalValue = simCash + totalDeployed;
+  const bankroll = positionSummary?.bankroll ?? 10000;
+  const totalDeployed = positionSummary?.total_deployed ?? 0;
+  const totalUnrealized = positionSummary?.total_unrealized ?? 0;
+  const totalRealized = positionSummary?.total_realized ?? 0;
+  const heat = positionSummary?.portfolio_heat ?? 0;
+  const cash = bankroll - totalDeployed;
+  const totalPnl = totalUnrealized + totalRealized;
 
-  // Category allocation from executed trades
+  // Category allocation from open positions
   const catAlloc = useMemo(() => {
     const map = new Map<string, number>();
-    simTrades.forEach((t) => {
-      const sig = signals.find((s) => s.ticker === t.ticker);
-      const cat = sig?.category || "Other";
-      map.set(cat, (map.get(cat) || 0) + t.sizeDollars);
+    openPositions.forEach((p) => {
+      const cat = p.category || "Other";
+      const deployed = p.entry_cost * (p.remaining_contracts / (p.contracts || 1));
+      map.set(cat, (map.get(cat) || 0) + deployed);
     });
-    // Add cash
-    map.set("Cash", simCash);
+    map.set("Cash", cash);
     return Array.from(map.entries()).sort((a, b) => b[1] - a[1]);
-  }, [simTrades, signals, simCash]);
+  }, [openPositions, cash]);
 
-  // Live P&L for sim trades
-  const tradesWithPnl = useMemo(() => {
-    return simTrades.map((t) => {
-      const mkt = markets.find((m) => m.ticker === t.ticker);
-      const livePrice = mkt?.price ?? t.entryPrice;
-      const priceDelta = livePrice - t.entryPrice;
-      const pnl = t.direction === "BUY_YES" ? priceDelta * t.contracts : -priceDelta * t.contracts;
-      return { ...t, livePrice, pnl };
+  // Enrich open positions with live prices
+  const enrichedPositions = useMemo(() => {
+    return openPositions.map((p) => {
+      const market = markets.find((m) => m.ticker === p.ticker);
+      const livePrice = market?.price ?? p.current_price;
+      let unrealized: number;
+      if (p.direction === "BUY_YES") {
+        unrealized = (livePrice - p.entry_price) * p.remaining_contracts - p.fees_paid;
+      } else {
+        unrealized = (p.entry_price - livePrice) * p.remaining_contracts - p.fees_paid;
+      }
+      return { ...p, livePrice, unrealized };
     });
-  }, [simTrades, markets]);
+  }, [openPositions, markets]);
 
-  const totalPnl = tradesWithPnl.reduce((sum, t) => sum + t.pnl, 0);
-
-  // Actionable signals (not already traded)
-  const tradedTickers = new Set(simTrades.map((t) => t.ticker));
+  // Actionable signals (not already in an open position)
+  const tradedTickers = new Set(openPositions.map((p) => p.ticker));
   const actionableSignals = signals.filter(
     (s) => s.recommended_contracts > 0 && !tradedTickers.has(s.ticker)
   );
@@ -60,15 +66,17 @@ export default function PortfolioPanel() {
         <div className="grid grid-cols-3 gap-2">
           <div className="bg-bg rounded p-2 border border-border">
             <div className="text-[9px] text-text-secondary uppercase">Cash</div>
-            <div className="font-mono text-sm font-bold text-green">{fmtDollar(simCash)}</div>
+            <div className="font-mono text-sm font-bold text-green">{fmtDollar(cash)}</div>
           </div>
           <div className="bg-bg rounded p-2 border border-border">
             <div className="text-[9px] text-text-secondary uppercase">Deployed</div>
             <div className="font-mono text-sm font-bold text-blue">{fmtDollar(totalDeployed)}</div>
           </div>
           <div className="bg-bg rounded p-2 border border-border">
-            <div className="text-[9px] text-text-secondary uppercase">Total</div>
-            <div className="font-mono text-sm font-bold">{fmtDollar(totalValue)}</div>
+            <div className="text-[9px] text-text-secondary uppercase">Heat</div>
+            <div className={`font-mono text-sm font-bold ${heat > 0.35 ? "text-amber" : "text-text-primary"}`}>
+              {(heat * 100).toFixed(0)}%
+            </div>
           </div>
         </div>
 
@@ -114,11 +122,11 @@ export default function PortfolioPanel() {
           </div>
         )}
 
-        {/* Actionable signals with Buy button */}
+        {/* Pending signals (auto-execution will pick these up) */}
         {actionableSignals.length > 0 && (
           <div>
             <div className="text-[10px] text-text-secondary uppercase tracking-wider mb-1.5">
-              Available Signals
+              Pending Signals ({actionableSignals.length})
             </div>
             <div className="space-y-1">
               {actionableSignals.slice(0, 5).map((sig) => (
@@ -137,45 +145,41 @@ export default function PortfolioPanel() {
                       </span>
                     </div>
                   </div>
-                  <button
-                    onClick={() => executeTrade(sig)}
-                    disabled={simCash < sig.risk.size_dollars}
-                    className={`px-2 py-1 rounded text-[9px] font-bold transition-colors ${
-                      sig.direction === "BUY_YES"
-                        ? "bg-green/20 text-green hover:bg-green/30 disabled:opacity-30"
-                        : "bg-red/20 text-red hover:bg-red/30 disabled:opacity-30"
-                    }`}
-                  >
-                    {sig.direction === "BUY_YES" ? "BUY YES" : "BUY NO"} ({fmtDollar(sig.risk.size_dollars)})
-                  </button>
+                  <span className={`px-2 py-1 rounded text-[9px] font-bold ${
+                    sig.direction === "BUY_YES"
+                      ? "bg-green/10 text-green"
+                      : "bg-red/10 text-red"
+                  }`}>
+                    {sig.direction === "BUY_YES" ? "YES" : "NO"}
+                  </span>
                 </div>
               ))}
             </div>
           </div>
         )}
 
-        {/* Transaction history */}
-        {tradesWithPnl.length > 0 && (
+        {/* Open positions summary */}
+        {enrichedPositions.length > 0 && (
           <div>
             <div className="text-[10px] text-text-secondary uppercase tracking-wider mb-1.5">
-              Trade History ({tradesWithPnl.length})
+              Open Positions ({enrichedPositions.length})
             </div>
             <div className="space-y-1">
-              {tradesWithPnl.map((t) => (
-                <div key={t.id} className="flex items-center justify-between bg-bg/50 rounded px-2 py-1 text-[10px]">
+              {enrichedPositions.map((p) => (
+                <div key={p.ticker} className="flex items-center justify-between bg-bg/50 rounded px-2 py-1 text-[10px]">
                   <div className="flex items-center gap-2 min-w-0">
-                    <span className={`font-bold ${t.direction === "BUY_YES" ? "text-green" : "text-red"}`}>
-                      {t.direction === "BUY_YES" ? "YES" : "NO"}
+                    <span className={`font-bold ${p.direction === "BUY_YES" ? "text-green" : "text-red"}`}>
+                      {p.direction === "BUY_YES" ? "YES" : "NO"}
                     </span>
-                    <span className="font-mono truncate max-w-[100px]" title={t.ticker}>
-                      {t.ticker.length > 16 ? t.ticker.slice(0, 16) + "\u2026" : t.ticker}
+                    <span className="font-mono truncate max-w-[100px]" title={p.ticker}>
+                      {p.ticker.length > 16 ? p.ticker.slice(0, 16) + "\u2026" : p.ticker}
                     </span>
                   </div>
                   <div className="flex items-center gap-3 shrink-0">
-                    <span className={`font-mono font-semibold ${t.pnl >= 0 ? "text-green" : "text-red"}`}>
-                      {t.pnl >= 0 ? "+" : ""}${t.pnl.toFixed(2)}
+                    <span className="font-mono text-text-secondary">{p.remaining_contracts}x</span>
+                    <span className={`font-mono font-semibold ${p.unrealized >= 0 ? "text-green" : "text-red"}`}>
+                      {p.unrealized >= 0 ? "+" : ""}${p.unrealized.toFixed(2)}
                     </span>
-                    <span className="text-text-secondary">{fmtRelativeTime(t.ts)}</span>
                   </div>
                 </div>
               ))}

@@ -13,13 +13,14 @@ warnings.filterwarnings("ignore")
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app.kalshi_client import KalshiClient
+import math
 import pandas as pd
 import numpy as np
 import requests as req
 
 RETRY = 3
 MIN_TRADES_FOR_STATS = 10     # need at least this many trades to run tests
-MIN_SCORE = 40                 # tradability threshold
+MIN_SCORE = 35                 # tradability threshold
 MAX_TRADE_PAGES = 20           # fetch up to 2000 trades per market
 
 
@@ -54,9 +55,16 @@ def trades_to_series(trades):
         return pd.Series(dtype=float)
     rows = []
     for t in trades:
+        # Support both API v1 (yes_price in cents) and v2 (yes_price_dollars)
+        if "yes_price_dollars" in t:
+            price = float(t["yes_price_dollars"])
+        elif "yes_price" in t:
+            price = t["yes_price"] / 100.0 if t["yes_price"] > 1 else float(t["yes_price"])
+        else:
+            continue
         rows.append({
             "time": pd.Timestamp(t["created_time"]),
-            "price": t["yes_price"] / 100.0,  # cents -> probability 0-1
+            "price": price,
         })
     df = pd.DataFrame(rows).sort_values("time")
     df = df.set_index("time")
@@ -152,19 +160,27 @@ def hurst_exponent(prices):
     return round(H, 3), round(score, 1)
 
 
+def _safe_logit_series(prices):
+    """Convert price series to logit space for symmetric analysis."""
+    clamped = prices.clip(0.01, 0.99)
+    return np.log(clamped / (1 - clamped))
+
+
 def autocorr_score(prices):
     """
     Autocorrelation of RETURNS at lags 1-10. Significant autocorrelation
     in returns = exploitable serial dependence = predictable.
     NOTE: Testing price levels (not returns) is trivially significant
     for any persistent process and tells you nothing about tradability.
+    Uses logit-space returns for symmetric analysis on bounded prices.
     Returns 0-100 score.
     """
     if len(prices) < 15:
         return 0.0
 
-    # Use returns, not levels -- level autocorrelation is trivially ~1.0
-    returns = prices.pct_change().dropna()
+    # Use logit-space returns for symmetric analysis on bounded prices
+    logit_prices = _safe_logit_series(prices)
+    returns = logit_prices.diff().dropna()
     if len(returns) < 15:
         return 0.0
 
@@ -217,6 +233,16 @@ def main():
             var_sc, adf_sc, hurst_sc, ac_sc = 0.0, 0.0, 0.0, 0.0
             H, regime = 0.5, "INSUFFICIENT_DATA"
 
+        # ADF test has reduced validity for prices bounded in [0,1]
+        # Near 0 or 1, prices are mechanically mean-reverting due to bounds
+        # Discount stationarity finding for extreme prices
+        if n_trades >= MIN_TRADES_FOR_STATS and len(prices) >= 2:
+            mean_price = float(prices.mean())
+            if mean_price < 0.10 or mean_price > 0.90:
+                adf_sc = adf_sc * 0.25
+            elif mean_price < 0.15 or mean_price > 0.85:
+                adf_sc = adf_sc * 0.5
+
         # Weighted tradability score
         # Volume weight 25%, Spread tightness 20%, Price variance 20%,
         # Autocorrelation 20%, Orderbook depth 15%
@@ -225,10 +251,10 @@ def main():
         depth_sc = min(row.get("depth_dollars", 0) / 5000 * 100, 100)
 
         total_score = (
-            0.25 * vol_sc
-            + 0.20 * spread_sc
+            0.15 * vol_sc       # was 0.25
+            + 0.25 * spread_sc  # was 0.20 — tighter spread matters more
             + 0.20 * var_sc
-            + 0.20 * ac_sc
+            + 0.25 * ac_sc      # was 0.20 — predictability matters more
             + 0.15 * depth_sc
         )
 

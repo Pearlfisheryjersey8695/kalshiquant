@@ -2,9 +2,12 @@
 
 import { useDashboard } from "@/lib/store";
 import { useState, useEffect } from "react";
+import type { RegimePerformance, AlphaAttribution } from "@/lib/types";
+
+const STARTING_CAPITAL = 10000;
 
 export default function Header() {
-  const { signalsMeta, wsConnected } = useDashboard();
+  const { signalsMeta, wsConnected, positionSummary, executionStatus } = useDashboard();
   const [showBacktest, setShowBacktest] = useState(false);
   const [btSummary, setBtSummary] = useState<{ trades: number; wr: number; pnl: number; prob: number } | null>(null);
 
@@ -27,7 +30,7 @@ export default function Header() {
   }, []);
 
   // Always show simulated portfolio value for hackathon demo
-  const balance = signalsMeta.portfolio_value || 10000;
+  const balance = signalsMeta.portfolio_value || STARTING_CAPITAL;
 
   return (
     <>
@@ -51,11 +54,43 @@ export default function Header() {
             <span className="font-mono font-semibold">{signalsMeta.total_signals}</span>
           </div>
           {signalsMeta.generated_at && (
-            <div>
-              <span className="text-text-secondary mr-1.5">Updated</span>
-              <span className="font-mono text-text-secondary">
+            <div className="flex items-center gap-1.5">
+              {signalsMeta.signal_source === "live" ? (
+                <span className="px-1.5 py-0.5 rounded text-[9px] font-mono font-bold bg-green/15 text-green border border-green/30">LIVE SIGNALS</span>
+              ) : signalsMeta.signal_source === "batch" ? (
+                <span className="px-1.5 py-0.5 rounded text-[9px] font-mono font-bold bg-amber/15 text-amber border border-amber/30">BATCH SIGNALS</span>
+              ) : (
+                <span className="px-1.5 py-0.5 rounded text-[9px] font-mono font-bold bg-text-secondary/15 text-text-secondary border border-text-secondary/30">CACHED</span>
+              )}
+              <span className="font-mono text-text-secondary text-[10px]">
                 {new Date(signalsMeta.generated_at).toLocaleTimeString()}
               </span>
+              <span className="font-mono text-text-secondary text-[10px]">
+                {signalsMeta.total_signals}mkts
+              </span>
+            </div>
+          )}
+          {/* Execution engine stats */}
+          {executionStatus && (
+            <div className="flex items-center gap-1.5 text-[10px] font-mono border-l border-border pl-4 ml-2">
+              <span className={`px-1 py-0.5 rounded text-[9px] font-bold ${
+                executionStatus.paused
+                  ? "bg-amber/15 text-amber border border-amber/30"
+                  : "bg-green/15 text-green border border-green/30"
+              }`}>
+                {executionStatus.paused ? "PAUSED" : "ENGINE"}
+              </span>
+              <span className="text-text-secondary">
+                {positionSummary?.open_positions ?? 0}pos
+              </span>
+              <span className={`${(positionSummary?.portfolio_heat ?? 0) > 0.35 ? "text-amber" : "text-text-secondary"}`}>
+                {((positionSummary?.portfolio_heat ?? 0) * 100).toFixed(0)}%heat
+              </span>
+              {positionSummary && (
+                <span className={positionSummary.today_pnl >= 0 ? "text-green" : "text-red"}>
+                  {positionSummary.today_pnl >= 0 ? "+" : ""}${positionSummary.today_pnl.toFixed(2)}
+                </span>
+              )}
             </div>
           )}
           {btSummary && (
@@ -155,9 +190,13 @@ function BacktestPanel() {
 
   const sortino = data.sortino_ratio ?? 0;
   const holdHrs = data.avg_hold_hours ?? 0;
+  const feeEff = data.fee_efficiency ?? (grossPnl !== 0 ? netPnl / grossPnl : 0);
+  const testDays = data.test_period_days ?? 1;
+  const annualized = (netPnl / STARTING_CAPITAL) / (testDays / 365) * 100;
+  const clusterProb = data.monte_carlo?.cluster_prob_positive ?? data.monte_carlo?.prob_positive ?? 0;
 
   const metrics = [
-    { label: "Total Trades", value: String(data.total_trades), color: "", hint: "Number of round-trip trades executed" },
+    { label: "Total Trades", value: `${data.total_trades}${data.monte_carlo?.effective_n ? ` (${data.monte_carlo.effective_n} clusters)` : ""}`, color: "", hint: `${data.total_trades} trades across ${data.monte_carlo?.effective_n ?? data.unique_underlyings} independent underlyings` },
     { label: "Win Rate", value: `${(data.win_rate * 100).toFixed(1)}%`, color: data.win_rate > 0.5 ? "text-green" : "text-red", hint: "% of trades with positive net P&L" },
     { label: "Sharpe (per-trade)", value: data.sharpe_ratio.toFixed(2), color: data.sharpe_ratio > 0.5 ? "text-green" : data.sharpe_ratio > 0 ? "text-amber" : "text-red", hint: "Mean P&L / std dev — risk-adjusted return" },
     { label: "Sortino", value: sortino.toFixed(2), color: sortino > 0.5 ? "text-green" : sortino > 0 ? "text-amber" : "text-red", hint: "Like Sharpe but only penalizes downside" },
@@ -165,12 +204,20 @@ function BacktestPanel() {
     { label: "Profit Factor", value: data.profit_factor.toFixed(2), color: data.profit_factor > 1 ? "text-green" : "text-red", hint: "Gross wins / gross losses — above 1 = profitable" },
     { label: "Avg Win/Loss", value: data.avg_win_loss_ratio.toFixed(2), color: data.avg_win_loss_ratio > 1 ? "text-green" : "text-red", hint: "Average winning trade / average losing trade" },
     { label: "Avg Hold", value: holdHrs > 0 ? `${holdHrs.toFixed(1)}h` : "N/A", color: "", hint: "Average time in position" },
+    { label: "Fee Efficiency", value: `${(feeEff * 100).toFixed(0)}%`, color: feeEff > 0.3 ? "text-green" : feeEff > 0.1 ? "text-amber" : "text-red", hint: "Net P&L as % of gross — higher means less fee drag" },
     { label: "Net P&L", value: `$${netPnl.toFixed(2)}`, color: netPnl > 0 ? "text-green" : "text-red", hint: "Total profit after all fees" },
     { label: "Return", value: `${(data.total_return * 100).toFixed(1)}%`, color: data.total_return > 0 ? "text-green" : "text-red", hint: "Net P&L as % of starting capital" },
   ];
 
   return (
     <div className="space-y-4">
+      {/* Strategy explanation */}
+      <div className="bg-bg rounded border border-border px-4 py-3 space-y-1.5 text-[11px] text-text-secondary">
+        <div className="flex items-start gap-2"><span className="text-blue mt-0.5 shrink-0">&#x2022;</span><span>Finds markets where price diverges from fair value by more than transaction costs.</span></div>
+        <div className="flex items-start gap-2"><span className="text-blue mt-0.5 shrink-0">&#x2022;</span><span>Primary alpha: convergence trading near expiry with fee-aware Kelly sizing.</span></div>
+        <div className="flex items-start gap-2"><span className="text-blue mt-0.5 shrink-0">&#x2022;</span><span>Generated <span className="font-mono font-semibold text-green">+${netPnl.toFixed(0)}</span> net on <span className="font-mono font-semibold text-text-primary">{data.total_trades}</span> trades. <span className="font-mono font-semibold text-text-primary">{(clusterProb * 100).toFixed(0)}%</span> probability of profit (cluster-adjusted Monte Carlo).</span></div>
+      </div>
+
       {/* Metrics cards */}
       <div className="grid grid-cols-5 gap-3">
         {metrics.map((m) => (
@@ -190,7 +237,7 @@ function BacktestPanel() {
           </span>
           <span className="text-text-secondary">
             Fees: <span className="font-mono font-semibold text-red">-${totalFees.toFixed(2)}</span>
-            <span className="ml-1 opacity-60">(3c/contract RT)</span>
+            <span className="ml-1 opacity-60">(dynamic Kalshi fees)</span>
           </span>
           <span className="text-text-secondary">
             {data.test_period_days != null && <>Period: <span className="font-mono">{data.test_period_days.toFixed(1)}d</span></>}
@@ -201,37 +248,54 @@ function BacktestPanel() {
         </div>
       )}
 
+      {/* Annualized return context */}
+      <div className="text-[10px] text-text-secondary px-1">
+        Annualized: <span className="font-mono font-semibold text-text-primary">~{annualized.toFixed(0)}%</span>
+        <span className="ml-3 opacity-60">S&amp;P 500 avg ~10% | Risk-free ~5%</span>
+      </div>
+
       {/* Monte Carlo headline */}
-      {data.monte_carlo && data.monte_carlo.prob_positive > 0 && (
-        <div className={`flex items-center gap-4 px-4 py-2.5 rounded border ${
-          data.monte_carlo.prob_positive >= 0.6
-            ? "bg-green/5 border-green/30"
-            : data.monte_carlo.prob_positive >= 0.4
-            ? "bg-amber/5 border-amber/30"
-            : "bg-red/5 border-red/30"
-        }`}>
-          <div className="text-center">
-            <div className={`font-mono text-2xl font-bold ${
-              data.monte_carlo.prob_positive >= 0.6 ? "text-green" : data.monte_carlo.prob_positive >= 0.4 ? "text-amber" : "text-red"
-            }`}>
-              {(data.monte_carlo.prob_positive * 100).toFixed(1)}%
+      {data.monte_carlo && data.monte_carlo.prob_positive > 0 && (() => {
+        const mc = data.monte_carlo!;
+        const clusterProb = mc.cluster_prob_positive ?? mc.prob_positive;
+        const effectiveN = mc.effective_n ?? mc.n_trades;
+        const displayProb = clusterProb;
+        return (
+          <div className={`flex items-center gap-4 px-4 py-2.5 rounded border ${
+            displayProb >= 0.6
+              ? "bg-green/5 border-green/30"
+              : displayProb >= 0.4
+              ? "bg-amber/5 border-amber/30"
+              : "bg-red/5 border-red/30"
+          }`}>
+            <div className="text-center min-w-[70px]">
+              <div className={`font-mono text-2xl font-bold ${
+                displayProb >= 0.6 ? "text-green" : displayProb >= 0.4 ? "text-amber" : "text-red"
+              }`}>
+                {(displayProb * 100).toFixed(1)}%
+              </div>
+              <div className="text-[9px] text-text-secondary">P(profit)</div>
             </div>
-            <div className="text-[9px] text-text-secondary">P(profit)</div>
+            <div className="flex-1 text-[10px] text-text-secondary">
+              <span className="font-semibold text-text-primary">Bootstrap confidence</span>:{" "}
+              <span className="font-mono font-semibold">{(mc.prob_positive * 100).toFixed(1)}%</span> trade-level
+              {effectiveN < mc.n_trades && (
+                <span className="ml-1">
+                  | <span className="font-mono font-semibold">{(clusterProb * 100).toFixed(1)}%</span> cluster-adjusted
+                  <span className="opacity-60 ml-1">({mc.n_trades} trades, {effectiveN} independent clusters)</span>
+                </span>
+              )}
+              {mc.final_percentiles && (
+                <span className="ml-1">
+                  {" | "}Median: <span className="font-mono">${mc.final_percentiles["50"]?.toFixed(0)}</span>{" | "}
+                  5th: <span className="font-mono text-red">${mc.final_percentiles["5"]?.toFixed(0)}</span>{" | "}
+                  95th: <span className="font-mono text-green">${mc.final_percentiles["95"]?.toFixed(0)}</span>
+                </span>
+              )}
+            </div>
           </div>
-          <div className="flex-1 text-[10px] text-text-secondary">
-            <span className="font-semibold text-text-primary">Bootstrap confidence</span>: Strategy is profitable in{" "}
-            <span className="font-mono font-semibold">{(data.monte_carlo.prob_positive * 100).toFixed(1)}%</span> of{" "}
-            <span className="font-mono">{(data.monte_carlo.n_resamples || 10000).toLocaleString()}</span> simulated scenarios.
-            {data.monte_carlo.final_percentiles && (
-              <span className="ml-1">
-                Median: <span className="font-mono">${data.monte_carlo.final_percentiles["50"]?.toFixed(0)}</span>{" | "}
-                5th: <span className="font-mono text-red">${data.monte_carlo.final_percentiles["5"]?.toFixed(0)}</span>{" | "}
-                95th: <span className="font-mono text-green">${data.monte_carlo.final_percentiles["95"]?.toFixed(0)}</span>
-              </span>
-            )}
-          </div>
-        </div>
-      )}
+        );
+      })()}
 
       {/* Confidence note */}
       {data.confidence_note && (
@@ -355,8 +419,9 @@ function BacktestPanel() {
                 {data.trades.slice(0, 50).map((t, i) => {
                   const net = t.net_pnl ?? t.pnl;
                   const fee = t.fee ?? 0;
+                  const isWinner = net > 0;
                   return (
-                    <tr key={i} className={`border-b border-border/30 ${i % 2 === 1 ? "bg-surface/50" : ""}`}>
+                    <tr key={i} className={`border-b border-border/30 ${isWinner ? "bg-green/5" : net < 0 ? "bg-red/5" : i % 2 === 1 ? "bg-surface/50" : ""}`}>
                       <td className="px-3 py-1 font-mono truncate max-w-[130px]" title={t.ticker}>
                         {t.ticker.length > 20 ? t.ticker.slice(0, 20) + "\u2026" : t.ticker}
                       </td>
@@ -388,26 +453,11 @@ function BacktestPanel() {
   );
 }
 
-interface RegimePerf {
-  trades: number;
-  wins: number;
-  win_rate: number;
-  net_pnl: number;
-  avg_fee_drag: number;
-  avg_edge: number;
-}
-
-interface AlphaSourceStats {
-  ir: number;
-  cumulative_pnl: number;
-  mean_return: number;
-  std_return: number;
-  trades: number;
-  status: string;
-}
-
 interface MonteCarloResult {
   prob_positive: number;
+  cluster_prob_positive?: number;
+  effective_n?: number;
+  largest_cluster_pct?: number;
   n_resamples: number;
   n_trades: number;
   bands: Record<string, number[]>;
@@ -427,11 +477,12 @@ interface BacktestResult {
   gross_pnl: number;
   total_fees: number;
   total_return: number;
+  fee_efficiency: number;
   test_period_days: number;
   unique_underlyings: number;
   confidence_note: string;
-  regime_performance: Record<string, RegimePerf>;
-  alpha_attribution?: Record<string, AlphaSourceStats>;
+  regime_performance: Record<string, RegimePerformance>;
+  alpha_attribution?: Record<string, AlphaAttribution>;
   equity_curve: { ts: string; equity: number }[];
   monte_carlo?: MonteCarloResult;
   trades: { ticker: string; direction: string; entry_price: number; exit_price: number; contracts: number; pnl: number; net_pnl: number; fee: number; exit_reason: string; regime: string; edge_at_entry: number }[];

@@ -47,7 +47,7 @@ export default function LiveFeed() {
                     <div className="flex-1 min-w-0">
                       <div className="flex items-center gap-2">
                         <span className={`text-[9px] font-mono font-bold ${style.color} uppercase`}>
-                          {event.event_type.replace("_", " ")}
+                          {event.event_type.replace(/_/g, " ")}
                         </span>
                         {event.ticker && (
                           <span className="text-[9px] font-mono text-text-secondary">{event.ticker}</span>

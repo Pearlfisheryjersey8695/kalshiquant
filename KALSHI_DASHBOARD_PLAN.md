@@ -1,4 +1,18 @@
-# KALSHI PREDICTIVE MARKET ANALYZER — COMPREHENSIVE BUILD PLAN
+Read ONLY these files: models/backtest.py, models/ensemble.py, dashboard/src/components/Header.tsx, signals/backtest_results.json. Don't read anything else.
+CONTEXT: KalshiQuant prediction market dashboard. Backtest produces 20 trades, +$111 net P&L, 68% P(profit). Dynamic Kalshi fees: ceil(0.07 × P × (1-P) × 100)/100 per side. Strategy is convergence trading on near-expiry markets where fair value diverges from price. Everything works, we're polishing for hackathon demo.
+DO THESE 5 THINGS:
+
+backtest.py — After trades are computed, build a trade_attribution list. Each trade gets: trade_number, ticker, direction, entry_price, exit_price, exit_reason, gross_pnl, fee_paid, net_pnl, regime, hold_hours, is_winner (net_pnl > 0). Save to signals/trade_attribution.json. Add fee_efficiency = total_net_pnl / total_gross_pnl to the metrics dict.
+backtest.py — For convergence trades, before adding to trades list: if estimated_fee > 0.40 × estimated_gross_profit, skip the trade. This kills fee-heavy losers.
+Header.tsx backtest modal — Add above the metric cards, three bullet strategy explanation:
+'Finds markets where price diverges from fair value by more than transaction costs.'
+'Primary alpha: convergence trading near expiry with fee-aware Kelly sizing.'
+'Generated +$X net on Y trades. Z% probability of profit (cluster-adjusted Monte Carlo).'
+Pull X, Y, Z from the backtest results JSON.
+Header.tsx backtest modal — Add fee_efficiency as a new metric card labeled 'Fee Efficiency' with hint 'Net P&L as % of gross — higher means less fee drag'. Add a Trade Log section below the P&L chart showing the trade_attribution table with green/red row backgrounds.
+Header.tsx backtest modal — Below metrics, add small gray text: 'Annualized: ~X%' calculated as (net_pnl / 10000) / (test_days / 365) × 100. Add context: 'S&P 500 avg ~10% | Risk-free ~5%'.
+
+Re-run backtest after change #2. Show updated numbers# KALSHI PREDICTIVE MARKET ANALYZER — COMPREHENSIVE BUILD PLAN
 ## DevonomicsV1 Hackathon (Mar 20–26, 2026)
 ### Claude Code Execution Blueprint
 

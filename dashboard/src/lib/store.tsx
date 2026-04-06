@@ -1,35 +1,41 @@
 "use client";
 
-import React, { createContext, useContext, useState, useCallback, useEffect, useRef } from "react";
+import React, { createContext, useContext, useState, useCallback, useEffect, useMemo } from "react";
 import { api } from "./api";
 import { useWebSocket } from "./useWebSocket";
-import type { Market, Signal, SignalsEnvelope, FeedEvent, Portfolio, RiskData } from "./types";
+import type { Market, Signal, SignalsEnvelope, FeedEvent, Portfolio, RiskData, Position, PositionSummary, ExecutionStatus } from "./types";
 
-export interface SimTrade {
-  id: number;
-  ticker: string;
-  title: string;
-  direction: "BUY_YES" | "BUY_NO";
-  contracts: number;
-  entryPrice: number;
-  sizeDollars: number;
-  ts: string;
+// Real-time P&L computed client-side from latest WS prices
+interface LivePnL {
+  total: number;         // unrealized + realized
+  unrealized: number;    // sum of all open positions
+  realized: number;      // from server
+  byPosition: { ticker: string; direction: string; pnl: number; contracts: number; entryPrice: number; currentPrice: number }[];
+  lastUpdate: number;    // timestamp ms
+  isStale: boolean;      // true if > 30s since last price update
 }
 
 interface DashboardState {
   markets: Market[];
   signals: Signal[];
-  signalsMeta: { generated_at: string; portfolio_value: number; total_signals: number };
+  signalsMeta: { generated_at: string; portfolio_value: number; total_signals: number; signal_source?: string };
   feedEvents: FeedEvent[];
   portfolio: Portfolio | null;
   risk: RiskData | null;
   selectedTicker: string | null;
   setSelectedTicker: (ticker: string | null) => void;
   wsConnected: boolean;
-  // Simulated portfolio
-  simCash: number;
-  simTrades: SimTrade[];
-  executeTrade: (signal: Signal) => void;
+  loading: boolean;
+  connectionError: string | null;
+  // Execution engine
+  openPositions: Position[];
+  closedPositions: Position[];
+  positionSummary: PositionSummary | null;
+  executionStatus: ExecutionStatus | null;
+  toggleExecution: () => void;
+  closePosition: (ticker: string) => void;
+  // Real-time P&L (computed client-side)
+  livePnL: LivePnL;
 }
 
 const DashboardContext = createContext<DashboardState | null>(null);
@@ -43,29 +49,51 @@ export function useDashboard() {
 export function DashboardProvider({ children }: { children: React.ReactNode }) {
   const [markets, setMarkets] = useState<Market[]>([]);
   const [signals, setSignals] = useState<Signal[]>([]);
-  const [signalsMeta, setSignalsMeta] = useState({ generated_at: "", portfolio_value: 10000, total_signals: 0 });
+  const [signalsMeta, setSignalsMeta] = useState<{ generated_at: string; portfolio_value: number; total_signals: number; signal_source?: string }>({ generated_at: "", portfolio_value: 10000, total_signals: 0 });
   const [feedEvents, setFeedEvents] = useState<FeedEvent[]>([]);
   const [portfolio, setPortfolio] = useState<Portfolio | null>(null);
   const [risk, setRisk] = useState<RiskData | null>(null);
   const [selectedTicker, setSelectedTicker] = useState<string | null>(null);
 
-  // Simulated portfolio
-  const [simCash, setSimCash] = useState(10000);
-  const [simTrades, setSimTrades] = useState<SimTrade[]>([]);
-  const tradeIdRef = useRef(0);
+  const [loading, setLoading] = useState(true);
+  const [connectionError, setConnectionError] = useState<string | null>(null);
 
-  const prevPricesRef = useRef<Map<string, number>>(new Map());
+  // Execution engine state
+  const [openPositions, setOpenPositions] = useState<Position[]>([]);
+  const [closedPositions, setClosedPositions] = useState<Position[]>([]);
+  const [positionSummary, setPositionSummary] = useState<PositionSummary | null>(null);
+  const [executionStatus, setExecutionStatus] = useState<ExecutionStatus | null>(null);
 
   // Initial data load
   useEffect(() => {
-    api.getMarkets().then(setMarkets).catch(() => {});
+    let loadedAny = false;
+    const markLoaded = () => { if (!loadedAny) { loadedAny = true; setLoading(false); } };
+
+    api.getMarkets().then((d) => { setMarkets(d); markLoaded(); }).catch((e) => console.error("Failed to load markets:", e));
     api.getSignals().then((env) => {
       setSignals(env.signals);
-      setSignalsMeta({ generated_at: env.generated_at, portfolio_value: env.portfolio_value, total_signals: env.total_signals });
-    }).catch(() => {});
-    api.getFeed(100).then(setFeedEvents).catch(() => {});
-    api.getPortfolio().then(setPortfolio).catch(() => {});
-    api.getRisk().then(setRisk).catch(() => {});
+      setSignalsMeta({ generated_at: env.generated_at, portfolio_value: env.portfolio_value, total_signals: env.total_signals, signal_source: env.signal_source });
+      markLoaded();
+    }).catch((e) => console.error("Failed to load signals:", e));
+    api.getFeed(100).then(setFeedEvents).catch((e) => console.error("Failed to load feed:", e));
+    api.getPortfolio().then(setPortfolio).catch((e) => console.error("Failed to load portfolio:", e));
+    api.getRisk().then(setRisk).catch((e) => console.error("Failed to load risk:", e));
+    // Execution engine
+    api.getPositions().then((d) => {
+      setOpenPositions(d.open);
+      setPositionSummary(d.summary);
+    }).catch((e) => console.error("Failed to load positions:", e));
+    api.getPositionsHistory().then((d) => setClosedPositions(d.closed)).catch((e) => console.error("Failed to load position history:", e));
+    api.getExecutionStatus().then(setExecutionStatus).catch((e) => console.error("Failed to load execution status:", e));
+
+    // Timeout: if nothing loaded after 8 seconds, show error
+    const timeout = setTimeout(() => {
+      if (!loadedAny) {
+        setConnectionError("Cannot connect to server at localhost:8000");
+        setLoading(false);
+      }
+    }, 8000);
+    return () => clearTimeout(timeout);
   }, []);
 
   // WS: prices
@@ -73,12 +101,7 @@ export function DashboardProvider({ children }: { children: React.ReactNode }) {
     path: "/ws/prices",
     onMessage: useCallback((msg: { type: string; data: Market[] }) => {
       if (msg.type === "prices" && Array.isArray(msg.data)) {
-        setMarkets((prev) => {
-          const newPrices = new Map<string, number>();
-          msg.data.forEach((m) => newPrices.set(m.ticker, m.price));
-          prevPricesRef.current = new Map(prev.map((m) => [m.ticker, m.price]));
-          return msg.data;
-        });
+        setMarkets(msg.data);
       }
     }, []),
   });
@@ -93,6 +116,7 @@ export function DashboardProvider({ children }: { children: React.ReactNode }) {
           generated_at: msg.data.generated_at,
           portfolio_value: msg.data.portfolio_value,
           total_signals: msg.data.total_signals,
+          signal_source: msg.data.signal_source,
         });
       }
     }, []),
@@ -112,31 +136,103 @@ export function DashboardProvider({ children }: { children: React.ReactNode }) {
     }, []),
   });
 
-  // Execute simulated trade — gated on cash deduction + 60% deployment limit
-  const executeTrade = useCallback((signal: Signal) => {
-    const sizeDollars = signal.risk.size_dollars;
-    let tradeCreated = false;
-    setSimCash((prev) => {
-      if (prev < sizeDollars) return prev; // insufficient funds
-      // Enforce 60% max deployment (40% cash reserve)
-      if (prev - sizeDollars < 10000 * 0.40) return prev;
-      tradeCreated = true;
-      return prev - sizeDollars;
-    });
-    // Only create trade if cash was actually deducted
-    if (!tradeCreated) return;
-    tradeIdRef.current += 1;
-    const trade: SimTrade = {
-      id: tradeIdRef.current,
-      ticker: signal.ticker,
-      title: signal.title,
-      direction: signal.direction as "BUY_YES" | "BUY_NO",
-      contracts: signal.recommended_contracts,
-      entryPrice: signal.current_price,
-      sizeDollars,
-      ts: new Date().toISOString(),
+  // WS: positions (real-time P&L updates every 5s)
+  useWebSocket<{ type: string; data: { open: Position[]; summary: PositionSummary } }>({
+    path: "/ws/positions",
+    onMessage: useCallback((msg: { type: string; data: { open: Position[]; summary: PositionSummary } }) => {
+      if (msg.type === "positions" && msg.data) {
+        setOpenPositions(msg.data.open || []);
+        setPositionSummary(msg.data.summary || null);
+      }
+    }, []),
+  });
+
+  // ── REAL-TIME CLIENT-SIDE P&L ─────────────────────────────────────────
+  // Recomputes INSTANTLY every time a WS price tick arrives.
+  // No waiting for server — the browser IS the pricing engine.
+  const livePnL = useMemo<LivePnL>(() => {
+    const priceMap = new Map<string, number>();
+    for (const m of markets) {
+      if (m.price > 0) priceMap.set(m.ticker, m.price);
+    }
+
+    const byPosition: LivePnL["byPosition"] = [];
+    let unrealized = 0;
+
+    for (const pos of openPositions) {
+      const currentPrice = priceMap.get(pos.ticker) || pos.current_price || 0;
+      let pnl = 0;
+
+      if (pos.direction === "BUY_YES") {
+        pnl = (currentPrice - pos.entry_price) * (pos.remaining_contracts || pos.contracts);
+      } else {
+        pnl = (pos.entry_price - currentPrice) * (pos.remaining_contracts || pos.contracts);
+      }
+
+      unrealized += pnl;
+      byPosition.push({
+        ticker: pos.ticker,
+        direction: pos.direction,
+        pnl: Math.round(pnl * 100) / 100,
+        contracts: pos.remaining_contracts || pos.contracts,
+        entryPrice: pos.entry_price,
+        currentPrice,
+      });
+    }
+
+    const realized = positionSummary?.total_realized ?? 0;
+    const now = Date.now();
+
+    // Check staleness: find the most recent market update
+    let latestUpdate = 0;
+    for (const m of markets) {
+      if (m.last_update_ts) {
+        const ts = new Date(m.last_update_ts).getTime();
+        if (ts > latestUpdate) latestUpdate = ts;
+      }
+    }
+
+    return {
+      total: Math.round((unrealized + realized) * 100) / 100,
+      unrealized: Math.round(unrealized * 100) / 100,
+      realized: Math.round(realized * 100) / 100,
+      byPosition: byPosition.sort((a, b) => Math.abs(b.pnl) - Math.abs(a.pnl)),
+      lastUpdate: latestUpdate || now,
+      isStale: latestUpdate > 0 && (now - latestUpdate) > 30000,
     };
-    setSimTrades((prev) => [trade, ...prev]);
+  }, [markets, openPositions, positionSummary]);
+
+  // Toggle execution engine pause/resume
+  const toggleExecution = useCallback(async () => {
+    const current = executionStatus;
+    if (!current) return;
+    const newPaused = !current.paused;
+    try {
+      if (newPaused) {
+        await api.pauseExecution();
+      } else {
+        await api.resumeExecution();
+      }
+      // Only update UI AFTER server confirms
+      const refreshed = await api.getExecutionStatus();
+      setExecutionStatus(refreshed);
+    } catch (e) {
+      console.error("Failed to toggle execution:", e);
+      // Re-fetch actual state on failure
+      api.getExecutionStatus().then(setExecutionStatus).catch(() => {});
+    }
+  }, [executionStatus]);
+
+  // Manual close position
+  const closePosition = useCallback((ticker: string) => {
+    api.closePosition(ticker).then(() => {
+      // Refresh positions
+      api.getPositions().then((d) => {
+        setOpenPositions(d.open);
+        setPositionSummary(d.summary);
+      }).catch((e) => console.error("Failed to refresh positions:", e));
+      api.getPositionsHistory().then((d) => setClosedPositions(d.closed)).catch((e) => console.error("Failed to refresh position history:", e));
+    }).catch((e) => console.error("Failed to close position:", e));
   }, []);
 
   return (
@@ -151,9 +247,15 @@ export function DashboardProvider({ children }: { children: React.ReactNode }) {
         selectedTicker,
         setSelectedTicker,
         wsConnected: priceConnected,
-        simCash,
-        simTrades,
-        executeTrade,
+        loading,
+        connectionError,
+        openPositions,
+        closedPositions,
+        positionSummary,
+        executionStatus,
+        toggleExecution,
+        closePosition,
+        livePnL,
       }}
     >
       {children}

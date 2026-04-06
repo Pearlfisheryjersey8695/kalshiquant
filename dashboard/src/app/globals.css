@@ -2,53 +2,276 @@
 @tailwind components;
 @tailwind utilities;
 
-@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&display=swap');
+
+/* ── Bloomberg Terminal Reset ──────────────────────────────────────────── */
 
 * {
+  box-sizing: border-box;
   scrollbar-width: thin;
-  scrollbar-color: #1e1e2e #0a0a0f;
+  scrollbar-color: #1a1a1a #000000;
 }
 
 *::-webkit-scrollbar {
-  width: 6px;
-  height: 6px;
+  width: 5px;
+  height: 5px;
 }
 *::-webkit-scrollbar-track {
-  background: #0a0a0f;
+  background: #000000;
 }
 *::-webkit-scrollbar-thumb {
-  background: #1e1e2e;
-  border-radius: 3px;
+  background: #1a1a1a;
 }
 
 body {
-  background: #0a0a0f;
-  color: #e0e0e0;
-  font-family: "IBM Plex Sans", sans-serif;
+  background: #000000;
+  color: #ffffff;
+  font-family: 'IBM Plex Mono', 'Courier New', monospace;
+  font-size: 13px;
+  line-height: 1.5;
+  overflow: hidden;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* ── Bloomberg Panel System ────────────────────────────────────────────── */
+
+.bb-panel {
+  border: 1px solid #1a1a1a;
+  background: #000000;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+
+.bb-panel-title {
+  color: #ff6600;
+  font-size: 12px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  background: #0f0f0f;
+  padding: 4px 8px;
+  border-bottom: 1px solid #ff6600;
+  flex-shrink: 0;
+}
+
+.bb-panel-body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+}
+
+/* ── Bloomberg Table ───────────────────────────────────────────────────── */
+
+.bb-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+
+.bb-table th {
+  color: #ff6600;
+  font-size: 12px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  text-align: left;
+  padding: 5px 8px;
+  border-bottom: 1px solid #1a1a1a;
+  background: #0a0a0a;
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  white-space: nowrap;
+  cursor: pointer;
+  user-select: none;
+}
+
+.bb-table td {
+  padding: 4px 8px;
+  white-space: nowrap;
+  color: #ffffff;
+  height: 28px;
+  vertical-align: middle;
+}
+
+.bb-table tr:nth-child(even) {
+  background: #080808;
+}
+
+.bb-table tr:nth-child(odd) {
+  background: #000000;
+}
+
+.bb-table tr:hover {
+  background: #111100 !important;
+}
+
+.bb-table tr.bb-selected {
+  background: #1a1a00 !important;
+}
+
+/* ── Bloomberg Colors ──────────────────────────────────────────────────── */
+
+.bb-orange { color: #ff6600; }
+.bb-green { color: #00ff00; }
+.bb-red { color: #ff0000; }
+.bb-yellow { color: #ffff00; }
+.bb-white { color: #ffffff; }
+.bb-dim { color: #888888; }
+.bb-blue { color: #00aaff; }
+
+.bb-bg-positive { background: rgba(0, 255, 0, 0.08); }
+.bb-bg-negative { background: rgba(255, 0, 0, 0.08); }
+
+/* ── Price Flash Animation ─────────────────────────────────────────────── */
+
+@keyframes priceFlash {
+  0% { background-color: transparent; }
+  20% { background-color: rgba(255, 255, 255, 0.15); }
+  100% { background-color: transparent; }
+}
+
+@keyframes priceFlashGreen {
+  0% { background-color: transparent; }
+  20% { background-color: rgba(0, 255, 0, 0.12); }
+  100% { background-color: transparent; }
+}
+
+@keyframes priceFlashRed {
+  0% { background-color: transparent; }
+  20% { background-color: rgba(255, 0, 0, 0.12); }
+  100% { background-color: transparent; }
+}
+
+.price-flash { animation: priceFlash 400ms ease-out; }
+.flash-green { animation: priceFlashGreen 400ms ease-out; }
+.flash-red { animation: priceFlashRed 400ms ease-out; }
+
+/* ── Pulsing Live Indicator ────────────────────────────────────────────── */
+
+@keyframes pulseLive {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.3; }
+}
+.pulse-live { animation: pulseLive 2s ease-in-out infinite; }
+
+/* ── Bloomberg Key:Value Grid ──────────────────────────────────────────── */
+
+.bb-kv {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 2px 14px;
+  font-size: 13px;
+}
+
+.bb-kv-label {
+  color: #ff6600;
+  text-transform: uppercase;
+  white-space: nowrap;
+  padding: 1px 0;
+}
+
+.bb-kv-value {
+  color: #ffffff;
+  text-align: right;
+  padding: 1px 0;
+}
+
+.bb-kv-separator {
+  grid-column: 1 / -1;
+  border-bottom: 1px solid #1a1a1a;
+  margin: 2px 0;
+}
+
+/* ── Bloomberg Header Bar ──────────────────────────────────────────────── */
+
+.bb-header {
+  height: 32px;
+  background: #0f0f0f;
+  border-bottom: 1px solid #ff6600;
+  display: flex;
+  align-items: center;
+  padding: 0 12px;
+  gap: 16px;
+  font-size: 13px;
+  flex-shrink: 0;
+}
+
+/* ── Bloomberg Input ───────────────────────────────────────────────────── */
+
+.bb-input {
+  background: #000000;
+  border: 1px solid #ff6600;
+  color: #ffffff;
+  font-family: 'IBM Plex Mono', 'Courier New', monospace;
+  font-size: 13px;
+  padding: 4px 8px;
+  outline: none;
+}
+
+.bb-input::placeholder {
+  color: #555555;
+}
+
+.bb-input:focus {
+  border-color: #ff8800;
+  box-shadow: 0 0 0 1px #ff660033;
+}
+
+/* ── Resizable Panel Handles ───────────────────────────────────────────── */
+
+[data-separator] {
+  background: #1a1a1a;
+  transition: background 150ms;
+  flex-shrink: 0;
+}
+
+[data-separator]:hover,
+[data-separator][data-active] {
+  background: #ff6600;
+}
+
+/* ── Command Palette Overlay ───────────────────────────────────────────── */
+
+.bb-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.85);
+  z-index: 100;
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding-top: 20vh;
+}
+
+.bb-palette {
+  background: #0a0a0a;
+  border: 1px solid #ff6600;
+  width: 520px;
+  max-height: 400px;
   overflow: hidden;
 }
 
-/* Price flash animations */
-@keyframes flash-green {
-  0% { background-color: rgba(0, 210, 106, 0.3); }
-  100% { background-color: transparent; }
-}
-@keyframes flash-red {
-  0% { background-color: rgba(255, 59, 59, 0.3); }
-  100% { background-color: transparent; }
-}
-.flash-green {
-  animation: flash-green 0.6s ease-out;
-}
-.flash-red {
-  animation: flash-red 0.6s ease-out;
+.bb-palette-input {
+  width: 100%;
+  background: #000000;
+  border: none;
+  border-bottom: 1px solid #1a1a1a;
+  color: #ffffff;
+  font-family: 'IBM Plex Mono', 'Courier New', monospace;
+  font-size: 13px;
+  padding: 8px 12px;
+  outline: none;
 }
 
-/* Pulsing live dot */
-@keyframes pulse-live {
-  0%, 100% { opacity: 1; }
-  50% { opacity: 0.4; }
-}
-.pulse-live {
-  animation: pulse-live 2s ease-in-out infinite;
+/* ── Utility ───────────────────────────────────────────────────────────── */
+
+.truncate-ticker {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 180px;
 }

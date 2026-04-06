@@ -68,7 +68,13 @@ class KalshiClient:
 
     # ---------- GENERIC REQUESTS ----------
     def get(self, path: str, params=None):
-        headers = self._headers("GET", path)
+        # Signature must include the full path with query string
+        if params:
+            from urllib.parse import urlencode
+            sign_path = f"{path}?{urlencode(params)}"
+        else:
+            sign_path = path
+        headers = self._headers("GET", sign_path)
         r = requests.get(
             self.base_url + path,
             headers=headers,
@@ -96,16 +102,33 @@ class KalshiClient:
 
     # ---------- PAGINATION HELPER ----------
     def paginate(self, path: str, key: str, params: dict | None = None, max_pages: int = 20):
-        """Fetch all pages for a cursor-paginated endpoint and return combined list."""
+        """Fetch all pages for a cursor-paginated endpoint and return combined list.
+        Includes rate limiting to avoid 429 errors from Kalshi API.
+        """
+        import time as _time
         params = dict(params or {})
         results = []
-        for _ in range(max_pages):
-            resp = self.get(path, params=params)
+        for page in range(max_pages):
+            try:
+                resp = self.get(path, params=params)
+            except Exception as e:
+                if "429" in str(e):
+                    logger.warning("Rate limited at page %d, waiting 2s...", page)
+                    _time.sleep(2)
+                    try:
+                        resp = self.get(path, params=params)
+                    except Exception:
+                        break
+                else:
+                    raise
             results.extend(resp.get(key, []))
             cursor = resp.get("cursor")
             if not cursor:
                 break
             params["cursor"] = cursor
+            # Rate limit: 0.3s between pages
+            if page < max_pages - 1:
+                _time.sleep(0.3)
         return results
 
     # ---------- PORTFOLIO ----------
@@ -122,8 +145,8 @@ class KalshiClient:
             params["cursor"] = cursor
         return self.get("/trade-api/v2/markets", params=params)
 
-    def get_all_markets(self, limit: int = 200) -> list:
-        return self.paginate("/trade-api/v2/markets", "markets", {"limit": limit})
+    def get_all_markets(self, limit: int = 200, max_pages: int = 15) -> list:
+        return self.paginate("/trade-api/v2/markets", "markets", {"limit": limit}, max_pages=max_pages)
 
     def get_market(self, ticker: str):
         return self.get(f"/trade-api/v2/markets/{ticker}")

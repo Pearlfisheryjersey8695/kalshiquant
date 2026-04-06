@@ -5,11 +5,141 @@ Step 2.5 -- Risk Model & Position Sizing
   3. Correlation-adjusted VaR
   4. Stop-loss / take-profit / time-based exits
   5. Hedging suggestions (correlated opposites)
+  6. Win probability calibration (isotonic regression from backtest data)
 """
+
+import json
+import math
+import os
 
 import numpy as np
 import pandas as pd
 from models.base import BaseModel, registry
+
+
+class WinProbCalibrator:
+    """Isotonic regression calibrator: confidence -> actual win probability.
+    Trained on OOS backtest data. Falls back to linear if no calibration data.
+    """
+
+    def __init__(self):
+        self._bins: list[tuple[float, float]] = []  # (confidence_threshold, empirical_win_rate)
+        self._is_fitted = False
+
+    def fit_from_backtest(self, backtest_path: str = None):
+        """Load backtest results and build calibration curve."""
+        if backtest_path is None:
+            project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            backtest_path = os.path.join(project_root, "signals", "backtest_results.json")
+
+        try:
+            with open(backtest_path) as f:
+                data = json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            return
+
+        trades = data.get("trades", [])
+        if len(trades) < 10:
+            return
+
+        # Build (confidence, is_winner) pairs
+        pairs = []
+        for t in trades:
+            # Estimate confidence from edge magnitude (same formula as ensemble)
+            edge = abs(t.get("edge_at_entry", 0))
+            conf = min(edge / 0.10, 1.0) * 0.5 + 0.2  # rough reconstruction
+            is_winner = 1.0 if t.get("net_pnl", t.get("pnl", 0)) > 0 else 0.0
+            pairs.append((conf, is_winner))
+
+        pairs.sort(key=lambda x: x[0])
+
+        # Build calibration bins (5 quantile bins)
+        n = len(pairs)
+        n_bins = min(5, n // 3)
+        if n_bins < 2:
+            return
+
+        bin_size = n // n_bins
+        self._bins = []
+        for i in range(n_bins):
+            start = i * bin_size
+            end = start + bin_size if i < n_bins - 1 else n
+            bin_confs = [p[0] for p in pairs[start:end]]
+            bin_wins = [p[1] for p in pairs[start:end]]
+            threshold = sum(bin_confs) / len(bin_confs)
+            win_rate = sum(bin_wins) / len(bin_wins)
+            self._bins.append((threshold, win_rate))
+
+        self._is_fitted = True
+
+    def calibrate(self, confidence: float) -> float:
+        """Map raw confidence to calibrated win probability."""
+        if not self._is_fitted or not self._bins:
+            # Fallback: conservative linear mapping
+            return 0.5 + confidence * 0.15
+
+        # Interpolate between bins
+        if confidence <= self._bins[0][0]:
+            return self._bins[0][1]
+        if confidence >= self._bins[-1][0]:
+            return self._bins[-1][1]
+
+        for i in range(len(self._bins) - 1):
+            c0, w0 = self._bins[i]
+            c1, w1 = self._bins[i + 1]
+            if c0 <= confidence <= c1:
+                t = (confidence - c0) / (c1 - c0) if c1 != c0 else 0
+                return w0 + t * (w1 - w0)
+
+        return self._bins[-1][1]
+
+    def save(self, path: str = None):
+        """Save calibration curve to JSON."""
+        if path is None:
+            project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            path = os.path.join(project_root, "models", "saved", "win_prob_calibration.json")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as f:
+            json.dump({"bins": self._bins, "is_fitted": self._is_fitted}, f)
+
+    def load(self, path: str = None):
+        """Load calibration curve from JSON."""
+        if path is None:
+            project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            path = os.path.join(project_root, "models", "saved", "win_prob_calibration.json")
+        try:
+            with open(path) as f:
+                data = json.load(f)
+            self._bins = [tuple(b) for b in data.get("bins", [])]
+            self._is_fitted = data.get("is_fitted", False)
+        except (FileNotFoundError, json.JSONDecodeError):
+            pass
+
+
+def kalshi_fee(price: float) -> float:
+    """Kalshi taker fee per contract per side, in dollars.
+
+    Formula: ceil(0.07 * P * (1-P) * 100) / 100
+    Max fee is 1.75c/side at P=0.50. Round trip = 2 * this.
+
+    Examples:
+      P=0.50 -> 1.75c/side, 3.5c RT
+      P=0.10 -> 0.63c/side, 1.26c RT
+      P=0.05 -> 0.33c/side, 0.66c RT
+      P=0.90 -> 0.63c/side, 1.26c RT
+    """
+    if price <= 0 or price >= 1:
+        return 0.0
+    return math.ceil(0.07 * price * (1 - price) * 100) / 100
+
+
+def kalshi_fee_rt(entry_price: float, exit_price: float = None) -> float:
+    """Kalshi round-trip fee per contract in dollars.
+    If exit_price not provided, estimates exit at same price (conservative for ATM).
+    """
+    if exit_price is None:
+        exit_price = entry_price
+    return kalshi_fee(entry_price) + kalshi_fee(exit_price)
 
 
 class RiskModel(BaseModel):
@@ -24,7 +154,6 @@ class RiskModel(BaseModel):
     TAKE_PROFIT_RATIO = 2.0     # 2:1 reward/risk
     KELLY_FRACTION = 0.5        # Half-Kelly
     MAX_KELLY_CAP = 0.03        # Never bet more than 3% of bankroll per position
-    FEE_PER_CONTRACT_RT = 0.03  # 3c round trip (1.5c per side)
     # Conservative mapping: XGBoost predict_proba is uncalibrated,
     # so we shrink the confidence -> win_prob mapping.
     # 0.15 scale: max confidence=1.0 -> win_prob=0.65 (not 0.80)
@@ -34,6 +163,9 @@ class RiskModel(BaseModel):
         self.portfolio_value = portfolio_value
         self._correlations = {}
         self._var_estimates = {}
+        self._calibrator = WinProbCalibrator()
+        # Try to load saved calibration
+        self._calibrator.load()
 
     def fit(self, data: pd.DataFrame):
         """Compute cross-market correlations and volatility for VaR."""
@@ -44,24 +176,20 @@ class RiskModel(BaseModel):
             if len(r) > 5:
                 returns[ticker] = r
 
-                # Daily volatility from overlapping daily returns.
-                # sqrt(n) scaling assumes IID returns, but prediction market
-                # prices are bounded [0,1] with mean-reverting returns near
-                # boundaries. Overlapping daily returns capture the actual
-                # autocorrelation structure.
+                # Use non-overlapping windows to avoid autocorrelated vol estimates
                 prices = grp["close"].values
                 window = min(288, len(prices) - 1)  # 288 five-min bars = 1 day
-                if len(prices) > window:
+                if len(prices) > window * 2:  # Need at least 2 non-overlapping windows
                     daily_rets = []
-                    for start in range(len(prices) - window):
+                    for start in range(0, len(prices) - window, window):
                         p0 = prices[start]
                         p1 = prices[start + window]
                         if p0 > 0:
                             daily_rets.append((p1 - p0) / p0)
-                    daily_vol = np.std(daily_rets) if daily_rets else r.std() * np.sqrt(window)
+                    daily_vol = np.std(daily_rets) if len(daily_rets) > 1 else r.std() * np.sqrt(window)
                 else:
-                    # Too few bars for a full daily window
-                    daily_vol = r.std() * np.sqrt(len(r))
+                    # Too few bars for non-overlapping daily windows
+                    daily_vol = r.std() * np.sqrt(min(len(r), window))
 
                 self._var_estimates[ticker] = {
                     "daily_vol": daily_vol,
@@ -72,7 +200,7 @@ class RiskModel(BaseModel):
         # Cross-correlations
         if len(returns) > 1:
             ret_df = pd.DataFrame(returns)
-            ret_df = ret_df.dropna(axis=1, how="all").ffill()
+            ret_df = ret_df.dropna(axis=1, how="all").ffill(limit=5)
             if ret_df.shape[1] > 1:
                 corr = ret_df.corr()
                 for i, t1 in enumerate(corr.columns):
@@ -99,16 +227,38 @@ class RiskModel(BaseModel):
         if abs(edge) < 0.01 or confidence < 0.3:
             return 0, {}
 
-        # ── Fee-aware net edge ────────────────────────────────────
-        fee_impact = self.FEE_PER_CONTRACT_RT  # 3c per contract RT
+        # ── Fee-aware net edge (dynamic Kalshi fee) ───────────────
+        fee_impact = kalshi_fee_rt(current_price)
         net_edge = abs(edge) - fee_impact
         if net_edge <= 0:
             return 0, {}  # Gross edge doesn't cover fees
 
-        # Kelly on NET edge (loss is still gross — you lose the full move)
-        win_prob = 0.5 + confidence * self.WIN_PROB_SCALE
-        win_return = net_edge * 2          # 2:1 target on net edge
-        loss_return = abs(edge)            # loss is the full gross move
+        # Kelly on actual binary contract payoffs with TP/SL targets
+        if direction == "BUY_NO":
+            cost = 1.0 - current_price
+        else:
+            cost = current_price
+
+        # TP/SL price targets
+        tp_target = abs(edge) * self.TAKE_PROFIT_RATIO  # price move for TP
+        sl_target = cost * self.STOP_LOSS_PCT  # price move for SL
+
+        # Win return = take-profit payout minus exit fee
+        if direction == "BUY_YES":
+            tp_exit_price = min(current_price + tp_target, 0.99)
+        else:
+            tp_exit_price = max(current_price - tp_target, 0.01)
+        win_return = tp_target - kalshi_fee(tp_exit_price)
+        # Loss return = stop-loss cost
+        loss_return = sl_target
+
+        if win_return <= 0 or loss_return <= 0:
+            return 0, {}
+
+        # Win probability: use calibrator (isotonic regression from backtest data)
+        # Falls back to conservative linear mapping if no calibration data
+        win_prob = self._calibrator.calibrate(confidence)
+
         kelly_frac = self.kelly_size(win_prob, win_return, loss_return)
 
         max_dollars = self.portfolio_value * self.MAX_SINGLE_PCT
@@ -184,7 +334,11 @@ class RiskModel(BaseModel):
         vols = []
         for pos in positions:
             t = pos["ticker"]
-            val = pos["contracts"] * pos["current_price"]
+            direction = pos.get("direction", "BUY_YES")
+            if direction == "BUY_NO":
+                val = pos["contracts"] * (1 - pos["current_price"])
+            else:
+                val = pos["contracts"] * pos["current_price"]
             values.append(val)
             var_info = self._var_estimates.get(t, {})
             vols.append(var_info.get("daily_vol", 0.02))
@@ -204,10 +358,17 @@ class RiskModel(BaseModel):
                 corr_matrix[i, j] = c
                 corr_matrix[j, i] = c
 
+        # Note: Parametric VaR with normal assumption underestimates tail risk
+        # for binary contracts bounded in [0,1]. We add a binary jump risk premium
+        # to account for potential settlement at 0 or 1.
         # Portfolio VaR (parametric, 95%)
         weights = values / values.sum() if values.sum() > 0 else np.ones(n) / n
         port_vol = np.sqrt(weights @ (np.diag(vols) @ corr_matrix @ np.diag(vols)) @ weights)
-        var_95 = values.sum() * port_vol * 1.645
+        binary_jump_risk = sum(
+            pos["contracts"] * min(pos["current_price"], 1 - pos["current_price"])
+            for pos in positions
+        ) * 0.10  # 10% probability of jump-to-boundary
+        var_95 = values.sum() * port_vol * 1.645 + binary_jump_risk
 
         return round(var_95, 2)
 

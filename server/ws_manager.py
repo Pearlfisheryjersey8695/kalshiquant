@@ -19,6 +19,8 @@ class WSManager:
         self._price_clients: set[WebSocket] = set()
         self._signal_clients: set[WebSocket] = set()
         self._feed_clients: set[WebSocket] = set()
+        self._position_clients: set[WebSocket] = set()
+        self._alert_clients: set[WebSocket] = set()
 
     # ── Connection management ──────────────────────────────────────────────
 
@@ -46,6 +48,22 @@ class WSManager:
     def disconnect_feed(self, ws: WebSocket) -> None:
         self._feed_clients.discard(ws)
 
+    async def connect_positions(self, ws: WebSocket) -> None:
+        await ws.accept()
+        self._position_clients.add(ws)
+        logger.info("Position client connected (%d total)", len(self._position_clients))
+
+    def disconnect_positions(self, ws: WebSocket) -> None:
+        self._position_clients.discard(ws)
+
+    async def connect_alerts(self, ws: WebSocket) -> None:
+        await ws.accept()
+        self._alert_clients.add(ws)
+        logger.info("Alert client connected (%d total)", len(self._alert_clients))
+
+    def disconnect_alerts(self, ws: WebSocket) -> None:
+        self._alert_clients.discard(ws)
+
     # ── Broadcasting ───────────────────────────────────────────────────────
 
     async def broadcast_prices(self, data: list[dict]) -> None:
@@ -59,6 +77,16 @@ class WSManager:
     async def broadcast_feed_event(self, event: dict) -> None:
         payload = json.dumps({"type": "feed", "data": event})
         await self._broadcast(self._feed_clients, payload)
+
+    async def broadcast_positions(self, data: dict) -> None:
+        payload = json.dumps({"type": "positions", "data": data}, default=str)
+        await self._broadcast(self._position_clients, payload)
+
+    async def broadcast_alerts(self, alerts: list) -> None:
+        if not self._alert_clients or not alerts:
+            return
+        payload = json.dumps({"type": "alerts", "data": alerts}, default=str)
+        await self._broadcast(self._alert_clients, payload)
 
     async def _broadcast(self, clients: set[WebSocket], payload: str) -> None:
         if not clients:
@@ -81,4 +109,6 @@ class WSManager:
             "prices": len(self._price_clients),
             "signals": len(self._signal_clients),
             "feed": len(self._feed_clients),
+            "positions": len(self._position_clients),
+            "alerts": len(self._alert_clients),
         }

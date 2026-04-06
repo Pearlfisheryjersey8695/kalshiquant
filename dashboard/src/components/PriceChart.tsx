@@ -166,7 +166,7 @@ export default function PriceChart() {
           });
         }
       });
-      ro.observe(containerRef.current!);
+      if (containerRef.current) ro.observe(containerRef.current);
       roRef = ro;
     });
 

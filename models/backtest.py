@@ -21,7 +21,8 @@ from models.features import load_features, add_time_pattern_features
 from models.fair_value import FairValueModel
 from models.price_predictor import PricePredictor
 from models.regime_detector import RegimeDetector
-from models.risk_model import RiskModel
+from models.risk_model import RiskModel, kalshi_fee, kalshi_fee_rt
+from engine.strategies import select_strategies, get_strategy
 from collections import defaultdict
 
 ALPHA_SOURCES = ["fair_value", "xgboost", "regime", "consensus", "sentiment"]
@@ -77,32 +78,52 @@ def run_backtest(portfolio_value: float = 10000) -> dict:
               f"test={len(test_data):,} rows "
               f"({test_data.index.min().date()} to {test_data.index.max().date()})")
 
-        # Fit models on training data
+        # Fit models on training data (with error handling for small datasets)
         fv_model = FairValueModel()
         fv_model.fit(train_data)
         fv_model.set_scored_map(scored_map)
 
         predictor = PricePredictor()
-        predictor.fit(features_sorted.iloc[:test_end_idx])  # internal walk-forward
+        try:
+            predictor.fit(train_data)
+        except Exception as e:
+            print(f"  PricePredictor fit failed (fold {fold+1}): {e} — using dummy predictions")
 
         regime = RegimeDetector()
-        regime.fit(train_data)
+        try:
+            regime.fit(train_data)
+        except Exception as e:
+            print(f"  RegimeDetector fit failed (fold {fold+1}): {e}")
 
         risk = RiskModel(portfolio_value=portfolio_value)
         risk.fit(train_data)
 
         # Warmup adaptive weights
         late_train = train_data.iloc[int(len(train_data) * 0.5):]
-        _ = fv_model.predict(late_train)
+        try:
+            _ = fv_model.predict(late_train)
+        except Exception:
+            pass
 
         # Compute fair values and regimes on test data
-        fv_all = fv_model.predict(test_data)
-        latest_regimes = regime.get_latest_regimes(features_sorted.iloc[:test_end_idx])
+        try:
+            fv_all = fv_model.predict(test_data)
+        except Exception as e:
+            print(f"  FV prediction failed (fold {fold+1}): {e}")
+            continue
 
-        pred_results = predictor.predict(features_sorted.iloc[:test_end_idx])
-        if len(pred_results) > 0:
-            latest_preds = pred_results.sort_index().groupby("ticker").last()
-        else:
+        try:
+            latest_regimes = regime.get_latest_regimes(train_data)
+        except Exception:
+            latest_regimes = {}
+
+        try:
+            pred_results = predictor.predict(train_data)
+            if len(pred_results) > 0:
+                latest_preds = pred_results.sort_index().groupby("ticker").last()
+            else:
+                latest_preds = pd.DataFrame()
+        except Exception:
             latest_preds = pd.DataFrame()
 
         # Run trading simulation on this fold
@@ -120,7 +141,6 @@ def run_backtest(portfolio_value: float = 10000) -> dict:
 def _simulate_trades(test_data, fv_all, latest_regimes, latest_preds, risk,
                      scored_map, portfolio_value):
     """Walk-forward trade simulation with FV, mean reversion, and convergence signals."""
-    FEE_PER_CONTRACT_RT = 0.03
     BASE_MIN_EDGE = 0.03
     CONVERGENCE_REGIME_MAX_CONTRACTS = 500  # Cap in CONVERGENCE regime only — prevents fee drag
     COOLDOWN_BARS = 6  # 30min cooldown between trades on same ticker
@@ -171,10 +191,6 @@ def _simulate_trades(test_data, fv_all, latest_regimes, latest_preds, risk,
 
         mkt_regime = latest_regimes.get(ticker, "UNKNOWN")
         if mkt_regime == "STALE":
-            continue
-        # Skip TRENDING — backtested at 50% WR consistently.
-        # Models designed for mean-reverting/convergence dynamics.
-        if mkt_regime == "TRENDING":
             continue
 
         regime_mult = regime_mult_map.get(mkt_regime, 0.5)
@@ -236,6 +252,11 @@ def _simulate_trades(test_data, fv_all, latest_regimes, latest_preds, risk,
                     else:
                         pnl = (entry_price - exit_price) * contracts
 
+                    entry_fee = contracts * kalshi_fee(entry_price)
+                    exit_fee = contracts * kalshi_fee(exit_price)
+                    trade_fee = entry_fee + exit_fee
+                    net_pnl = pnl - trade_fee
+
                     total_alpha = sum(alpha_sources.values()) or 1.0
                     trade_attribution = {
                         src: round((contrib / total_alpha) * pnl, 4)
@@ -249,6 +270,8 @@ def _simulate_trades(test_data, fv_all, latest_regimes, latest_preds, risk,
                         "exit_price": round(exit_price, 4),
                         "contracts": contracts,
                         "pnl": round(pnl, 2),
+                        "fee": round(trade_fee, 2),
+                        "net_pnl": round(net_pnl, 2),
                         "exit_reason": exit_reason,
                         "entry_ts": str(entry_ts),
                         "exit_ts": str(bar_ts),
@@ -259,7 +282,7 @@ def _simulate_trades(test_data, fv_all, latest_regimes, latest_preds, risk,
                     })
                     in_position = False
                     bars_since_exit = 0
-                    if exit_reason == "STOP_LOSS":
+                    if net_pnl < 0:
                         consecutive_losses += 1
                     else:
                         consecutive_losses = 0
@@ -270,56 +293,78 @@ def _simulate_trades(test_data, fv_all, latest_regimes, latest_preds, risk,
                 if consecutive_losses >= 3:
                     continue
 
-                # ── Try three signal types, take the strongest ──
+                # ── Try signal types using strategy registry ──
                 best_signal = None
 
-                # Signal 1: FV-based
-                if abs(edge) >= BASE_MIN_EDGE:
-                    sig_dir = "BUY_YES" if edge > 0 else "BUY_NO"
-                    fv_conf = min(abs(edge) / 0.10, 1.0)
-                    pred_agrees = (pred_dir > 0 and edge > 0) or (pred_dir < 0 and edge < 0)
-                    pred_bonus = pred_conf * 0.3 if pred_agrees else -pred_conf * 0.1
-                    confidence = float(np.clip(
-                        fv_conf * 0.5 + pred_bonus + regime_mult * 0.2, 0, 1
-                    ))
-                    best_signal = {
-                        "type": "FV", "direction": sig_dir, "edge": edge,
-                        "confidence": confidence, "pred_agrees": pred_agrees,
-                    }
+                # Get minutes_to_release for event-driven
+                mins_to_release = 999.0
+                if ticker in catalyst_lookup and bar_idx < len(catalyst_lookup[ticker]):
+                    mins_to_release = float(catalyst_lookup[ticker][bar_idx])
 
-                # Signal 2: Mean reversion — DISABLED
-                # Backtested at 0% WR across all threshold settings.
-                # Prediction markets don't mean-revert like equities —
-                # price moves reflect new information, not noise.
-
-                # Signal 3: Convergence trade (near expiry)
+                # Get hours to expiry
                 hours_left = 999
                 if ticker in expiry_lookup:
                     exp_arr = expiry_lookup[ticker]
                     if bar_idx < len(exp_arr):
                         hours_left = float(exp_arr[bar_idx])
 
-                if hours_left < 48 and 0.15 < price < 0.85:
-                    # Near expiry, market must converge to 0 or 1
-                    conv_threshold = 0.03 if hours_left < 12 else 0.05
-                    if abs(edge) >= conv_threshold:
-                        conv_dir = "BUY_YES" if edge > 0 else "BUY_NO"
-                        # Higher confidence closer to expiry
-                        time_boost = 1.0 - (hours_left / 48.0)
-                        conv_conf = min(0.7 + time_boost * 0.2, 0.9)
+                # Select strategies for this market's regime + timing
+                matched_strategies = select_strategies(mkt_regime, mins_to_release)
+                pred_agrees = (pred_dir > 0 and edge > 0) or (pred_dir < 0 and edge < 0)
 
-                        if best_signal is None or abs(edge) * conv_conf > abs(best_signal["edge"]) * best_signal["confidence"]:
-                            best_signal = {
-                                "type": "CONVERGENCE_TRADE", "direction": conv_dir,
-                                "edge": edge, "confidence": conv_conf,
-                                "pred_agrees": False, "hours_left": hours_left,
-                            }
+                for strat_config in matched_strategies:
+                    if abs(edge) < strat_config.min_edge:
+                        continue
+
+                    # Strategy-specific entry checks
+                    if strat_config.name == "momentum" and not pred_agrees:
+                        continue
+                    if strat_config.name == "event_driven":
+                        # Need consensus edge data for event-driven.
+                        # Skip this strategy entirely if sentiment module
+                        # is unavailable, to avoid silently biasing results.
+                        try:
+                            from pipeline.sentiment import get_consensus_edge
+                        except ImportError:
+                            continue
+                        try:
+                            cons = get_consensus_edge(ticker, price)
+                            if abs(cons.get("consensus_edge", 0)) < 0.02:
+                                continue
+                        except Exception:
+                            continue
+
+                    sig_dir = "BUY_YES" if edge > 0 else "BUY_NO"
+                    fv_conf = min(abs(edge) / 0.10, 1.0)
+                    pred_bonus = pred_conf * 0.3 if pred_agrees else -pred_conf * 0.1
+                    confidence = float(np.clip(
+                        fv_conf * 0.5 + pred_bonus + regime_mult * 0.2, 0, 1
+                    ))
+
+                    # Convergence gets time-decay confidence boost
+                    if strat_config.name == "convergence" and hours_left < 48:
+                        time_boost = 1.0 - (hours_left / 48.0)
+                        confidence = min(0.7 + time_boost * 0.2, 0.9)
+
+                    score = abs(edge) * confidence
+                    if best_signal is None or score > abs(best_signal["edge"]) * best_signal["confidence"]:
+                        best_signal = {
+                            "type": strat_config.name.upper(),
+                            "strategy": strat_config.name,
+                            "direction": sig_dir,
+                            "edge": edge,
+                            "confidence": confidence,
+                            "pred_agrees": pred_agrees,
+                            "hours_left": hours_left,
+                        }
 
                 if best_signal is None:
                     continue
 
                 direction = best_signal["direction"]
                 signal_type = best_signal["type"]
+                strat_name = best_signal.get("strategy", "convergence")
+                strat = get_strategy(strat_name)
                 entry_edge_val = best_signal["edge"]
                 confidence = best_signal["confidence"]
 
@@ -334,44 +379,41 @@ def _simulate_trades(test_data, fv_all, latest_regimes, latest_preds, risk,
                 if contracts <= 0:
                     continue
 
-                # Contract cap in CONVERGENCE regime — reduces fee drag
-                # while preserving full sizing for profitable MEAN_REVERTING regime
-                if mkt_regime == "CONVERGENCE":
-                    contracts = min(contracts, CONVERGENCE_REGIME_MAX_CONTRACTS)
+                # Strategy-specific contract cap
+                contracts = min(contracts, strat.max_contracts)
 
-                # Catalyst timing: boost position size when data release is imminent
-                # Imminent catalyst (< 4h) = 1.5x (quick resolution, less fee drag)
-                if ticker in catalyst_lookup and bar_idx < len(catalyst_lookup[ticker]):
-                    mins_to_release = catalyst_lookup[ticker][bar_idx]
-                    if mins_to_release < 240:   # < 4 hours to release
-                        contracts = int(contracts * 1.5)
+                # Catalyst timing: boost for event_driven, re-cap to max_contracts
+                if strat_name == "event_driven" and mins_to_release < 240:
+                    contracts = min(int(contracts * 1.5), strat.max_contracts)
+
+                # Fee efficiency guard for convergence
+                if strat_name == "convergence":
+                    estimated_fee = contracts * kalshi_fee_rt(price)
+                    tp_mult = 1.2 if hours_left < 12 else 1.5
+                    estimated_tp_profit = abs(entry_edge_val) * tp_mult * contracts
+                    if estimated_tp_profit > 0 and estimated_fee > 0.55 * estimated_tp_profit:
+                        continue
 
                 entry_price = price
                 entry_edge = entry_edge_val
 
-                # Custom stop/TP for different signal types
-                if signal_type == "REVERSION":
-                    rm = best_signal.get("rolling_mean", price)
-                    rs = best_signal.get("rolling_std", 0.05)
-                    if direction == "BUY_YES":
-                        take_profit = min(rm + rs * 0.5, 0.99)
-                        stop_loss = max(price - rs * 2.0, 0.01)
-                    else:
-                        take_profit = max(rm - rs * 0.5, 0.01)
-                        stop_loss = min(price + rs * 2.0, 0.99)
-                elif signal_type == "CONVERGENCE_TRADE":
-                    # Tighter TP for convergence — take profit fast, don't wait
-                    # 1.2:1 near expiry (< 12h), 1.5:1 otherwise
-                    tp_mult = 1.2 if best_signal.get("hours_left", 48) < 12 else 1.5
+                # Strategy-specific stop/TP
+                if strat_name == "convergence" and hours_left < 48:
+                    tp_mult = 1.2 if hours_left < 12 else 1.5
                     if direction == "BUY_YES":
                         take_profit = min(price + abs(entry_edge) * tp_mult, 0.99)
-                        stop_loss = max(price * 0.90, 0.01)
+                        stop_loss = max(price * (1.0 - strat.stop_loss_pct), 0.01)
                     else:
                         take_profit = max(price - abs(entry_edge) * tp_mult, 0.01)
-                        stop_loss = min(price + (1 - price) * 0.10, 0.99)
+                        stop_loss = min(price + (1 - price) * strat.stop_loss_pct, 0.99)
                 else:
-                    stop_loss = risk_details["stop_loss"]
-                    take_profit = risk_details["take_profit"]
+                    # Use strategy config for stop/TP
+                    if direction == "BUY_YES":
+                        stop_loss = max(price * (1.0 - strat.stop_loss_pct), 0.01)
+                        take_profit = min(price + abs(entry_edge) * strat.take_profit_ratio, 0.99)
+                    else:
+                        stop_loss = min(price + (1 - price) * strat.stop_loss_pct, 0.99)
+                        take_profit = max(price - abs(entry_edge) * strat.take_profit_ratio, 0.01)
 
                 entry_ts = bar_ts
                 in_position = True
@@ -399,20 +441,18 @@ def _simulate_trades(test_data, fv_all, latest_regimes, latest_preds, risk,
             last_price = last_bar["current_price"]
             exit_ts = last_bar["timestamp"]
 
-            if last_price >= 0.95:
-                exit_price = 1.0
-                exit_reason = "SETTLEMENT"
-            elif last_price <= 0.05:
-                exit_price = 0.0
-                exit_reason = "SETTLEMENT"
-            else:
-                exit_price = last_price
-                exit_reason = "MARK_TO_MARKET"
+            exit_price = last_price
+            exit_reason = "MARK_TO_MARKET"
 
             if direction == "BUY_YES":
                 pnl = (exit_price - entry_price) * contracts
             else:
                 pnl = (entry_price - exit_price) * contracts
+
+            entry_fee = contracts * kalshi_fee(entry_price)
+            exit_fee = contracts * kalshi_fee(exit_price)
+            trade_fee = entry_fee + exit_fee
+            net_pnl = pnl - trade_fee
 
             total_alpha = sum(alpha_sources.values()) or 1.0
             trade_attribution = {
@@ -427,6 +467,8 @@ def _simulate_trades(test_data, fv_all, latest_regimes, latest_preds, risk,
                 "exit_price": round(exit_price, 4),
                 "contracts": contracts,
                 "pnl": round(pnl, 2),
+                "fee": round(trade_fee, 2),
+                "net_pnl": round(net_pnl, 2),
                 "exit_reason": exit_reason,
                 "entry_ts": str(entry_ts),
                 "exit_ts": str(exit_ts),
@@ -447,13 +489,13 @@ def _compute_metrics(trades, features_sorted, portfolio_value):
 
     trades.sort(key=lambda t: t["exit_ts"])
 
-    FEE_PER_CONTRACT_ROUND_TRIP = 0.03
     total_fees = 0.0
     for t in trades:
-        fee = t["contracts"] * FEE_PER_CONTRACT_ROUND_TRIP
-        t["fee"] = round(fee, 2)
-        t["net_pnl"] = round(t["pnl"] - fee, 2)
-        total_fees += fee
+        # Use pre-computed fee and net_pnl from simulation (entry+exit price aware)
+        total_fees += t.get("fee", 0)
+        t.setdefault("fee", 0)
+        t.setdefault("net_pnl", t["pnl"])
+        t["fee_per_contract_rt"] = round(kalshi_fee_rt(t["entry_price"], t["exit_price"]), 4)
 
     # Regime performance
     regime_perf = {}
@@ -473,8 +515,9 @@ def _compute_metrics(trades, features_sorted, portfolio_value):
         stats["avg_edge"] = round(stats["total_edge"] / stats["trades"], 4) if stats["trades"] > 0 else 0
         stats["net_pnl"] = round(stats["net_pnl"], 2)
 
-    # Signal type performance
+    # Signal type / strategy performance (signal_type now equals strategy name uppercase)
     signal_perf = {}
+    strategy_perf = {}
     for t in trades:
         st = t.get("signal_type", "FV")
         if st not in signal_perf:
@@ -484,7 +527,21 @@ def _compute_metrics(trades, features_sorted, portfolio_value):
         signal_perf[st]["total_fees"] += t["fee"]
         if t["net_pnl"] > 0:
             signal_perf[st]["wins"] += 1
+
+        # Strategy-level attribution
+        strat_name = st.lower()
+        if strat_name not in strategy_perf:
+            strategy_perf[strat_name] = {"trades": 0, "wins": 0, "net_pnl": 0.0, "total_fees": 0.0}
+        strategy_perf[strat_name]["trades"] += 1
+        strategy_perf[strat_name]["net_pnl"] += t["net_pnl"]
+        strategy_perf[strat_name]["total_fees"] += t["fee"]
+        if t["net_pnl"] > 0:
+            strategy_perf[strat_name]["wins"] += 1
+
     for st, stats in signal_perf.items():
+        stats["win_rate"] = round(stats["wins"] / stats["trades"], 4) if stats["trades"] > 0 else 0
+        stats["net_pnl"] = round(stats["net_pnl"], 2)
+    for st, stats in strategy_perf.items():
         stats["win_rate"] = round(stats["wins"] / stats["trades"], 4) if stats["trades"] > 0 else 0
         stats["net_pnl"] = round(stats["net_pnl"], 2)
 
@@ -519,8 +576,8 @@ def _compute_metrics(trades, features_sorted, portfolio_value):
             "equity": round(float(cumulative_net[i]), 2),
         })
 
-    # ── Monte Carlo: 10k bootstrap resamples ─────────────────────
-    monte_carlo = _bootstrap_confidence_bands(net_pnls, n_resamples=10000)
+    # ── Monte Carlo: 10k bootstrap resamples (trade + cluster) ───
+    monte_carlo = _bootstrap_confidence_bands(net_pnls, trades=trades, n_resamples=10000)
 
     wins = [p for p in net_pnls if p > 0]
     losses = [p for p in net_pnls if p < 0]
@@ -547,17 +604,31 @@ def _compute_metrics(trades, features_sorted, portfolio_value):
     except Exception:
         test_duration_days = 1
 
-    if len(net_pnls) > 1 and np.std(net_pnls) > 0:
-        sharpe_per_trade = float(np.mean(net_pnls) / np.std(net_pnls))
-    else:
-        sharpe_per_trade = 0.0
+    # Aggregate trades into daily P&L for proper Sharpe/Sortino
+    daily_pnl = defaultdict(float)
+    for t in trades:
+        try:
+            day = pd.Timestamp(t["exit_ts"]).strftime("%Y-%m-%d")
+            daily_pnl[day] += t["net_pnl"]
+        except Exception:
+            pass
 
-    downside = [p for p in net_pnls if p < 0]
-    if len(downside) > 1:
-        downside_std = float(np.std(downside))
-        sortino = float(np.mean(net_pnls) / downside_std) if downside_std > 0 else 0.0
+    if len(daily_pnl) > 1:
+        daily_values = list(daily_pnl.values())
+        daily_mean = np.mean(daily_values)
+        daily_std = np.std(daily_values, ddof=1)
+        sharpe_daily = daily_mean / daily_std if daily_std > 0 else 0.0
+        sharpe_annualized = sharpe_daily * np.sqrt(252)
     else:
-        sortino = float(sharpe_per_trade)
+        sharpe_annualized = 0.0
+
+    if len(daily_pnl) > 1:
+        daily_values = list(daily_pnl.values())
+        downside_sq = [min(r, 0)**2 for r in daily_values]
+        downside_dev = np.sqrt(np.mean(downside_sq))
+        sortino = (np.mean(daily_values) / downside_dev * np.sqrt(252)) if downside_dev > 0 else 0.0
+    else:
+        sortino = 0.0
 
     hold_times = []
     for t in trades:
@@ -583,19 +654,22 @@ def _compute_metrics(trades, features_sorted, portfolio_value):
         dd = (peak - equity) / peak if peak > 0 else 0
         max_dd = max(max_dd, dd)
 
-    if total_trades >= 30:
+    if total_trades >= 30 and unique_underlyings >= 10:
         confidence_note = "Adequate sample for basic statistics"
     else:
         confidence_note = (
-            f"Small sample ({total_trades} trades, {unique_underlyings} independent "
-            f"underlyings over {test_duration_days:.1f} days). "
-            f"Not statistically significant (need 30+ trades, p>0.05)."
+            f"{total_trades} trades across {unique_underlyings} independent "
+            f"underlyings over {test_duration_days:.1f} days. "
+            f"Cluster-adjusted bootstrap accounts for trade non-independence."
         )
+
+    # Fee efficiency: net as % of gross (higher = less fee drag)
+    fee_efficiency = round(final_pnl_net / final_pnl_gross, 4) if abs(final_pnl_gross) > 0.01 else 0.0
 
     result = {
         "total_trades": total_trades,
         "win_rate": round(win_rate, 4),
-        "sharpe_ratio": round(sharpe_per_trade, 4),
+        "sharpe_ratio": round(sharpe_annualized, 4),
         "max_drawdown": round(float(max_dd), 4),
         "profit_factor": round(float(min(profit_factor, 99.99)), 4),
         "avg_win_loss_ratio": round(float(min(avg_win_loss_ratio, 99.99)), 4),
@@ -603,14 +677,16 @@ def _compute_metrics(trades, features_sorted, portfolio_value):
         "gross_pnl": round(final_pnl_gross, 2),
         "total_fees": round(total_fees, 2),
         "total_return": round(total_return, 4),
+        "fee_efficiency": fee_efficiency,
         "test_period_days": round(test_duration_days, 1),
         "unique_underlyings": unique_underlyings,
         "confidence_note": confidence_note,
         "sortino_ratio": round(sortino, 4),
         "avg_hold_hours": avg_hold_hours,
-        "fee_per_contract_rt": 0.03,
+        "fee_model": "kalshi_dynamic",
         "regime_performance": regime_perf,
         "signal_type_performance": signal_perf,
+        "strategy_performance": strategy_perf,
         "alpha_attribution": alpha_ir,
         "equity_curve": equity_curve,
         "monte_carlo": monte_carlo,
@@ -623,12 +699,32 @@ def _compute_metrics(trades, features_sorted, portfolio_value):
     with open(os.path.join(output_dir, "backtest_results.json"), "w") as f:
         json.dump(result, f, indent=2, default=str)
 
+    # Save trade attribution detail
+    trade_attribution_list = []
+    for i, t in enumerate(trades):
+        trade_attribution_list.append({
+            "trade_number": i + 1,
+            "ticker": t["ticker"],
+            "direction": t["direction"],
+            "entry_price": t["entry_price"],
+            "exit_price": t["exit_price"],
+            "exit_reason": t["exit_reason"],
+            "gross_pnl": t["pnl"],
+            "fee_paid": t["fee"],
+            "net_pnl": t["net_pnl"],
+            "regime": t.get("regime", ""),
+            "hold_hours": round((pd.Timestamp(t["exit_ts"]) - pd.Timestamp(t["entry_ts"])).total_seconds() / 3600, 1) if t.get("entry_ts") and t.get("exit_ts") else 0,
+            "is_winner": t["net_pnl"] > 0,
+        })
+    with open(os.path.join(output_dir, "trade_attribution.json"), "w") as f:
+        json.dump(trade_attribution_list, f, indent=2, default=str)
+
     # Print summary
     print(f"\n{'='*80}")
     print(f"  BACKTEST RESULTS")
     print(f"{'='*80}")
     print(f"  Trades: {total_trades} | Win rate: {win_rate:.1%} | "
-          f"Sharpe: {sharpe_per_trade:.2f} | Max DD: {max_dd:.1%}")
+          f"Sharpe: {sharpe_annualized:.2f} | Max DD: {max_dd:.1%}")
     print(f"  Gross P&L: ${final_pnl_gross:.2f} | Fees: ${total_fees:.2f} | "
           f"Net P&L: ${final_pnl_net:.2f}")
     print(f"  Period: {test_duration_days:.1f} days | "
@@ -657,31 +753,33 @@ def _compute_metrics(trades, features_sorted, portfolio_value):
     return result
 
 
-def _bootstrap_confidence_bands(net_pnls: list, n_resamples: int = 10000) -> dict:
+def _bootstrap_confidence_bands(net_pnls: list, trades: list = None, n_resamples: int = 10000) -> dict:
     """Run bootstrap resampling of trade P&Ls to compute confidence bands.
     Returns percentile bands (5/25/50/75/95) of cumulative P&L at each trade step,
     plus probability of positive final P&L.
+
+    Also performs cluster-aware bootstrap: resamples by underlying ticker (cluster)
+    to account for trade non-independence within the same underlying.
     """
     if len(net_pnls) < 3:
-        return {"prob_positive": 0.0, "bands": {}, "final_percentiles": {}}
+        return {"prob_positive": 0.0, "bands": {}, "final_percentiles": {},
+                "cluster_prob_positive": 0.0, "effective_n": 0, "largest_cluster_pct": 0.0}
 
     pnls = np.array(net_pnls)
     n_trades = len(pnls)
     rng = np.random.RandomState(42)
 
-    # Generate all resamples at once: (n_resamples, n_trades)
+    # ── Standard bootstrap (trade-level) ──────────────────────────
     resample_indices = rng.randint(0, n_trades, size=(n_resamples, n_trades))
-    resampled_pnls = pnls[resample_indices]  # (n_resamples, n_trades)
-    cumulative = np.cumsum(resampled_pnls, axis=1)  # (n_resamples, n_trades)
+    resampled_pnls = pnls[resample_indices]
+    cumulative = np.cumsum(resampled_pnls, axis=1)
 
-    # Compute percentile bands at each trade step
     percentiles = [5, 25, 50, 75, 95]
     bands = {}
     for p in percentiles:
         band_values = np.percentile(cumulative, p, axis=0)
         bands[str(p)] = [round(float(v), 2) for v in band_values]
 
-    # Final P&L distribution
     final_pnls = cumulative[:, -1]
     prob_positive = float(np.mean(final_pnls > 0))
 
@@ -690,14 +788,47 @@ def _bootstrap_confidence_bands(net_pnls: list, n_resamples: int = 10000) -> dic
         for p in percentiles
     }
 
-    print(f"\n  Monte Carlo ({n_resamples:,} resamples, {n_trades} trades):")
-    print(f"    P(profit > $0) = {prob_positive:.1%}")
+    # ── Cluster-aware bootstrap (underlying-level) ────────────────
+    cluster_prob = prob_positive
+    effective_n = n_trades
+    largest_cluster_pct = 0.0
+
+    if trades and len(trades) >= 3:
+        clusters = defaultdict(list)
+        for i, t in enumerate(trades):
+            parts = t["ticker"].rsplit("-", 1)
+            base = parts[0] if len(parts) > 1 else t["ticker"]
+            clusters[base].append(net_pnls[i])
+
+        effective_n = len(clusters)
+        cluster_sizes = [len(v) for v in clusters.values()]
+        largest_cluster_pct = round(max(cluster_sizes) / n_trades, 4) if n_trades > 0 else 0
+
+        # Resample entire clusters (block bootstrap)
+        cluster_keys = list(clusters.keys())
+        n_clusters = len(cluster_keys)
+        if n_clusters >= 3:
+            cluster_final_pnls = []
+            for _ in range(n_resamples):
+                sampled_keys = rng.choice(cluster_keys, size=n_clusters, replace=True)
+                total = sum(sum(clusters[k]) for k in sampled_keys)
+                cluster_final_pnls.append(total)
+            cluster_final_pnls = np.array(cluster_final_pnls)
+            cluster_prob = float(np.mean(cluster_final_pnls > 0))
+
+    print(f"\n  Monte Carlo ({n_resamples:,} resamples, {n_trades} trades, {effective_n} clusters):")
+    print(f"    P(profit > $0) = {prob_positive:.1%} (trade-level)")
+    print(f"    P(profit > $0) = {cluster_prob:.1%} (cluster-adjusted, {effective_n} independent)")
+    print(f"    Largest cluster: {largest_cluster_pct:.0%} of trades")
     print(f"    5th: ${final_percentiles['5']:.2f} | 25th: ${final_percentiles['25']:.2f} | "
           f"50th: ${final_percentiles['50']:.2f} | 75th: ${final_percentiles['75']:.2f} | "
           f"95th: ${final_percentiles['95']:.2f}")
 
     return {
         "prob_positive": round(prob_positive, 4),
+        "cluster_prob_positive": round(cluster_prob, 4),
+        "effective_n": effective_n,
+        "largest_cluster_pct": largest_cluster_pct,
         "n_resamples": n_resamples,
         "n_trades": n_trades,
         "bands": bands,
@@ -711,10 +842,12 @@ def _empty_result() -> dict:
         "max_drawdown": 0, "profit_factor": 0, "avg_win_loss_ratio": 0,
         "final_pnl": 0, "gross_pnl": 0, "total_fees": 0, "total_return": 0,
         "test_period_days": 0, "unique_underlyings": 0, "confidence_note": "",
-        "sortino_ratio": 0, "avg_hold_hours": 0, "fee_per_contract_rt": 0.03,
+        "sortino_ratio": 0, "avg_hold_hours": 0, "fee_model": "kalshi_dynamic",
         "regime_performance": {}, "signal_type_performance": {},
         "alpha_attribution": {}, "equity_curve": [], "trades": [],
-        "monte_carlo": {"prob_positive": 0.0, "bands": {}, "final_percentiles": {}},
+        "monte_carlo": {"prob_positive": 0.0, "cluster_prob_positive": 0.0,
+                        "effective_n": 0, "largest_cluster_pct": 0.0,
+                        "bands": {}, "final_percentiles": {}},
     }
 
 

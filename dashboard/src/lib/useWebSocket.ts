@@ -13,6 +13,7 @@ export function useWebSocket<T>({ path, onMessage }: UseWSOptions<T>) {
   const wsRef = useRef<WebSocket | null>(null);
   const [connected, setConnected] = useState(false);
   const onMessageRef = useRef(onMessage);
+  const retryCountRef = useRef(0);
   onMessageRef.current = onMessage;
 
   const connect = useCallback(() => {
@@ -20,7 +21,10 @@ export function useWebSocket<T>({ path, onMessage }: UseWSOptions<T>) {
     const ws = new WebSocket(url);
     wsRef.current = ws;
 
-    ws.onopen = () => setConnected(true);
+    ws.onopen = () => {
+      setConnected(true);
+      retryCountRef.current = 0; // Reset on successful connection
+    };
 
     ws.onmessage = (event) => {
       try {
@@ -31,10 +35,12 @@ export function useWebSocket<T>({ path, onMessage }: UseWSOptions<T>) {
 
     ws.onclose = () => {
       setConnected(false);
-      // Auto-reconnect after 3s
+      // First retry: 100ms, then 200ms, 400ms, 800ms, 1.6s, 3.2s, max 15s
+      const delay = Math.min(100 * Math.pow(2, retryCountRef.current), 15000);
+      retryCountRef.current += 1;
       setTimeout(() => {
         if (wsRef.current === ws) connect();
-      }, 3000);
+      }, delay);
     };
 
     ws.onerror = () => ws.close();

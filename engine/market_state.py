@@ -89,10 +89,16 @@ class MarketStateStore:
             ticker = row["ticker"]
             tradeable_info = tradeable_map.get(ticker, {})
 
-            # Initial price from snapshot data (cents -> [0,1])
-            yes_bid = tradeable_info.get("yes_bid", 0) / 100.0
-            yes_ask = tradeable_info.get("yes_ask", 0) / 100.0
-            price = (yes_bid + yes_ask) / 2.0 if (yes_bid > 0 and yes_ask > 0) else 0.0
+            # Initial price from snapshot data
+            # Handle both cents (>1) and probability (0-1) formats
+            raw_bid = tradeable_info.get("yes_bid", 0)
+            raw_ask = tradeable_info.get("yes_ask", 0)
+            yes_bid = raw_bid / 100.0 if raw_bid > 1 else float(raw_bid)
+            yes_ask = raw_ask / 100.0 if raw_ask > 1 else float(raw_ask)
+            # Also try last_price if no bid/ask
+            raw_last = tradeable_info.get("last_price", 0)
+            last_price = raw_last / 100.0 if raw_last > 1 else float(raw_last)
+            price = (yes_bid + yes_ask) / 2.0 if (yes_bid > 0 and yes_ask > 0) else last_price
 
             state = TickerState(
                 ticker=ticker,
@@ -113,28 +119,82 @@ class MarketStateStore:
         logger.info("Initialized %d markets from scored data", len(tickers))
         return tickers
 
+    def add_market(self, data: dict) -> None:
+        """Add a market dynamically (e.g., from WS messages for untracked tickers)."""
+        ticker = data.get("ticker", "")
+        if not ticker or ticker in self._markets:
+            return
+        state = TickerState(
+            ticker=ticker,
+            title=str(data.get("title", "")),
+            category=str(data.get("category", "")),
+            price=float(data.get("price", 0)),
+            yes_bid=float(data.get("yes_bid", 0)),
+            yes_ask=float(data.get("yes_ask", 0)),
+            volume=int(data.get("volume", 0)),
+            open_interest=int(data.get("open_interest", 0)),
+            expiration_time=str(data.get("expiration_time", "")),
+            tradability_score=float(data.get("tradability_score", 0)),
+        )
+        self._markets[ticker] = state
+        self._history[ticker] = deque(maxlen=HISTORY_MAXLEN)
+
     def update_from_ticker_msg(self, msg: dict) -> None:
         """
         Process a Kalshi WS ticker message.
-        Prices arrive in CENTS (0-100) — convert to [0,1] here.
+        Supports both API v1 (cents) and v2 (dollars) formats.
+        Auto-adds markets not yet in the store.
         """
         ticker = msg.get("market_ticker", "")
-        if not ticker or ticker not in self._markets:
+        if not ticker:
             return
+
+        # Auto-add if not tracked (enables discovery of new markets)
+        if ticker not in self._markets:
+            self.add_market({"ticker": ticker})
 
         state = self._markets[ticker]
         old_price = state.price
 
-        # Convert cents -> [0,1]
-        new_price = msg.get("price", 0) / 100.0
-        yes_bid = msg.get("yes_bid", 0) / 100.0
-        yes_ask = msg.get("yes_ask", 0) / 100.0
+        # Parse price — support both cents (int) and dollars (string/float)
+        def _parse_price(val, fallback=0.0):
+            if val is None:
+                return fallback
+            if isinstance(val, str):
+                try:
+                    v = float(val)
+                    return v  # dollars format (0.0-1.0)
+                except (ValueError, TypeError):
+                    return fallback
+            if isinstance(val, (int, float)):
+                return val / 100.0 if val > 1 else float(val)
+            return fallback
+
+        # Try v2 fields first (_dollars suffix), fall back to v1 (cents)
+        new_price = _parse_price(msg.get("yes_price_dollars", msg.get("price")))
+        yes_bid = _parse_price(msg.get("yes_bid_dollars", msg.get("yes_bid")))
+        yes_ask = _parse_price(msg.get("yes_ask_dollars", msg.get("yes_ask")))
+
+        # Volume — support both int and _fp string
+        volume = msg.get("volume", msg.get("volume_fp", state.volume))
+        if isinstance(volume, str):
+            try:
+                volume = int(float(volume))
+            except (ValueError, TypeError):
+                volume = state.volume
+
+        oi = msg.get("open_interest", msg.get("open_interest_fp", state.open_interest))
+        if isinstance(oi, str):
+            try:
+                oi = int(float(oi))
+            except (ValueError, TypeError):
+                oi = state.open_interest
 
         state.price = new_price if new_price > 0 else state.price
         state.yes_bid = yes_bid if yes_bid > 0 else state.yes_bid
         state.yes_ask = yes_ask if yes_ask > 0 else state.yes_ask
-        state.volume = msg.get("volume", state.volume)
-        state.open_interest = msg.get("open_interest", state.open_interest)
+        state.volume = volume
+        state.open_interest = oi
         state.last_update_ts = datetime.now(timezone.utc).isoformat()
 
         # Append to history
