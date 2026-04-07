@@ -15,7 +15,7 @@ It includes:
 - Fair value models driven by external data (CoinGecko, Yahoo Finance, FRED)
 - Walk-forward backtesting with fee-aware Kelly sizing
 - Autonomous trading agent (QuantBrain) with reinforcement learning
-- Bloomberg-style 9-tab dashboard with live risk monitoring
+- Bloomberg-style 6-tab terminal UI with live risk monitoring
 
 ## Current Status
 
@@ -46,15 +46,14 @@ Kalshi WS --> MarketState --> LiveFeatures --> Ensemble --> QuantBrain --> Trade
 
 | Key | Tab | Description |
 |-----|-----|-------------|
-| F1 | **Dashboard** | Market scanner, price chart, signal detail, trade blotter |
-| F2 | **Risk Engine** | VaR, correlations, P&L calendar, equity curve, position heatmap |
-| F3 | **Strategy Lab** | Configure strategies, risk limits, backtest integration |
-| F4 | **Backtest** | Walk-forward results, Monte Carlo, equity curve, trade log |
-| F5 | **Sentiment** | Signal agreement, regime distribution, arbitrage scanner |
-| F6 | **Morning Brief** | Overnight P&L, live news, opportunities, alerts |
-| F7 | **Trade Journal** | Full trade history with filters, notes, signal context |
-| F8 | **Performance** | Monthly returns, rolling Sharpe, drawdown, attribution |
-| F9 | **Quant Brain** | Autonomous agent: theses, RL policy, lessons learned |
+| F1 | **INTEL** | Morning brief: overnight P&L, news, opportunities, alerts, expiring markets |
+| F2 | **SCANNER** | Market scanner with signal agreement table, regime distribution |
+| F3 | **ANALYTICS** | Cross-market correlations, divergence alerts, performance attribution |
+| F4 | **EXECUTE** | Trade blotter, order management, live P&L per position |
+| F5 | **RISK** | P&L calendar, correlation matrix, equity curve, risk summary |
+| F6 | **REVIEW** | Trade journal, RL policy map, lessons learned, calibration metrics |
+
+Press **Ctrl+K** for command palette (live market search).
 
 ## Tech Stack
 
@@ -66,9 +65,9 @@ Kalshi WS --> MarketState --> LiveFeatures --> Ensemble --> QuantBrain --> Trade
 ## Quick Start
 
 ```bash
-# Clone
-git clone https://github.com/YOUR_USERNAME/kalshi-dashboard.git
-cd kalshi-dashboard
+# Clone (replace with your fork URL)
+git clone https://github.com/<your-username>/kalshi-quant.git
+cd kalshi-quant
 
 # Python deps
 pip install -r requirements.txt
@@ -150,7 +149,8 @@ kalshi-dashboard/
   models/        # Fair value, XGBoost, HMM regime, risk, ensemble, backtest
   pipeline/      # Data cleaning, sentiment
   server/        # FastAPI, routes, WebSocket manager, risk engine, alerts
-  dashboard/     # Next.js 14 frontend (9-tab Bloomberg terminal)
+  dashboard/     # Next.js 14 frontend (6-tab Bloomberg terminal)
+  tests/         # Pytest unit tests (Kelly, Brier, lognormal probability)
 ```
 
 ## Disclaimer
