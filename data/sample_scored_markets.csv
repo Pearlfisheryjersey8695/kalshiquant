@@ -1,0 +1,6 @@
+ticker,title,category,volume,open_interest,spread,depth_dollars,n_trades,timespan_hours,variance_score,adf_score,regime,hurst_H,hurst_score,autocorr_score,volume_score,spread_score,depth_score,tradability_score,has_external_model
+KXFED-26APR-T3.75,Federal Funds Rate above 3.75% in April,Economics,5419,5419,1,500,61,168.0,42.0,90.0,MEAN_REVERTING,0.45,40.0,55.0,11.0,93.0,50.0,68.5,True
+KXBTCMAXMON-BTC-26APR30-8000000,Bitcoin Max Monthly above 80000 in April,Crypto,12000,12000,1,750,150,720.0,55.0,75.0,TRENDING,0.55,33.0,60.0,24.0,93.0,50.0,72.3,True
+KXBTCMAXMON-BTC-26APR30-7500000,Bitcoin Max Monthly above 75000 in April,Crypto,18500,18500,1,900,210,720.0,62.0,75.0,CONVERGENCE,0.50,25.0,65.0,37.0,93.0,50.0,75.8,True
+KXAAAGASM-26APR30-3.30,Gas Price Average above 3.30 in April,Economics,3000,3000,1,300,40,168.0,38.0,70.0,MEAN_REVERTING,0.48,15.0,50.0,6.0,93.0,50.0,62.1,True
+KXINX-26APR30-6800,S&P 500 above 6800 in April,Financials,8500,8500,1,600,80,168.0,48.0,75.0,TRENDING,0.52,20.0,58.0,17.0,93.0,50.0,67.4,True

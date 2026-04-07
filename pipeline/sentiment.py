@@ -55,7 +55,10 @@ def _analyze_event_likelihood(title: str, price: float) -> tuple[float, str]:
         if rate_match:
             target_rate = float(rate_match.group(1))
             fed_data = feed_manager.fed.fetch()
-            current_fed = fed_data["target_rate_mid"] if fed_data else 4.375
+            if not fed_data:
+                # Skip rather than use stale fallback — better no signal than wrong signal
+                return (price, "Fed feed unavailable — no signal")
+            current_fed = fed_data["target_rate_mid"]
             distance = abs(target_rate - current_fed)
 
             is_above = any(kw in title_lower for kw in ("above", "over", "exceed", "higher"))
@@ -101,7 +104,9 @@ def _analyze_event_likelihood(title: str, price: float) -> tuple[float, str]:
         if price_match:
             target = int(price_match.group(1))
             crypto_data = feed_manager.crypto.fetch()
-            current_btc = crypto_data["btc_price"] if crypto_data else 69000
+            if not crypto_data or crypto_data.get("btc_price", 0) <= 0:
+                return (price, "BTC feed unavailable — no signal")
+            current_btc = crypto_data["btc_price"]
 
             if "max" in title_lower or "above" in title_lower or "over" in title_lower:
                 ratio = target / current_btc if current_btc > 0 else 1
@@ -128,7 +133,9 @@ def _analyze_event_likelihood(title: str, price: float) -> tuple[float, str]:
         if gas_match:
             target_gas = float(gas_match.group(1))
             gas_data = feed_manager.gas.fetch()
-            current_gas = gas_data["current_price"] if gas_data else 3.30
+            if not gas_data or gas_data.get("current_price", 0) <= 0:
+                return (price, "Gas feed unavailable — no signal")
+            current_gas = gas_data["current_price"]
             diff = target_gas - current_gas
 
             is_above = any(kw in title_lower for kw in ("above", "over", "exceed", "higher"))

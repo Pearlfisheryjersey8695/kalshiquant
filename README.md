@@ -8,12 +8,28 @@
 
 A full-stack quantitative trading platform that analyzes prediction markets on [Kalshi](https://kalshi.com), generates trading signals using ML models and external data, and executes trades through an autonomous AI agent (QuantBrain).
 
-**This is NOT a toy.** It includes:
+**Status**: Research / paper trading. The system stays in paper mode until calibration metrics prove positive alpha (see Go-Live Gates below).
+
+It includes:
 - Real-time WebSocket streaming from Kalshi API
 - Fair value models driven by external data (CoinGecko, Yahoo Finance, FRED)
 - Walk-forward backtesting with fee-aware Kelly sizing
-- Autonomous trading agent with reinforcement learning
+- Autonomous trading agent (QuantBrain) with reinforcement learning
 - Bloomberg-style 9-tab dashboard with live risk monitoring
+
+## Current Status
+
+| Component | Status |
+|-----------|--------|
+| WebSocket streaming | Live |
+| External data feeds | BTC/SPX live (CoinGecko, Yahoo); Fed/Gas need free FRED API key |
+| Fair value model | Rewired to use external probabilities (50% weight) |
+| Walk-forward backtester | Working — see `/api/backtest/run` |
+| QuantBrain agent | Built and reasoning. RL is **untrained** (needs 50+ paper trades) |
+| Calibration tracker | Built — Brier score, alpha vs market, go-live readiness |
+| Live execution | **Disabled** until calibration gates pass |
+
+This is a research codebase being actively developed. The architecture is production-grade; the **demonstrated alpha is not yet proven**. That's by design — the system enforces a paper trading period until the model beats the market on a Brier score test.
 
 ## Architecture
 

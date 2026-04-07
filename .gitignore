@@ -16,6 +16,13 @@ dist/
 data/*.csv
 data/*.parquet
 signals/*.json
+# Keep sample data so first-clone has something to work with
+!data/sample_*.csv
+
+# Models
+models/saved/*.json
+models/saved/*.pkl
+!models/saved/.gitkeep
 
 # Node
 dashboard/node_modules/
@@ -29,3 +36,5 @@ NUL
 # IDE
 .vscode/
 .idea/
+data/*.db
+data/last_refresh.json
