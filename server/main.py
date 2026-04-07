@@ -250,6 +250,7 @@ router = create_router(
     alert_engine=alert_engine,
     quant_brain=quant_brain,
     parlay_pricer=parlay_pricer,
+    scheduler=scheduler,
 )
 app.include_router(router)
 

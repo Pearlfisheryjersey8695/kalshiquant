@@ -54,6 +54,9 @@ jobs:
           print('All critical modules import OK')
           "
 
+      - name: Look-ahead bias scan (strict)
+        run: python -m scripts.scan_lookahead --strict --severity WARNING
+
       - name: Run unit tests
         run: pytest tests/ -v
 

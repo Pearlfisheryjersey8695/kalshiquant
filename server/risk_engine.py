@@ -86,12 +86,38 @@ class RiskEngine:
         if heat > 0.70:  # 70% deployed
             kill_reasons.append(f"heat {heat:.0%} > 70%")
 
+        # ── CVaR projected-loss gate ────────────────────────────────────
+        # Projects forward: if the 5% tail loss on the open book exceeds 8% of
+        # bankroll, the book is structurally too tail-heavy. Trip the kill
+        # switch BEFORE the loss is realized rather than after.
+        cvar_95 = 0.0
+        try:
+            open_positions = position_manager.get_open_positions() if hasattr(position_manager, 'get_open_positions') else []
+            if open_positions:
+                from models.risk_model import RiskModel
+                risk_model = RiskModel(portfolio_value=total_capital)
+                # Smaller sim count for the 30s loop — keep it cheap
+                cvar_result = risk_model.portfolio_cvar(
+                    open_positions, n_sims=2000, seed=int(now) % 10_000
+                )
+                cvar_95 = cvar_result.get("cvar_95", 0.0)
+                if cvar_95 > total_capital * 0.08:
+                    should_kill = True
+                    kill_reasons.append(
+                        f"CVaR ${cvar_95:.0f} > 8% of capital (${total_capital * 0.08:.0f})"
+                    )
+        except Exception as e:
+            # CVaR is advisory — don't let a sim failure block the rest of the check
+            import logging
+            logging.getLogger("kalshi.risk").debug("CVaR check failed: %s", e)
+
         return {
             "equity": round(equity, 2),
             "peak_equity": round(self._peak_equity, 2),
             "drawdown_pct": round(drawdown_pct, 4),
             "hourly_pnl": round(hourly_loss, 2),
             "heat": round(heat, 4),
+            "cvar_95": round(cvar_95, 2),
             "should_kill": should_kill,
             "kill_reasons": kill_reasons,
             "kill_switch_active": self.kill_switch_active,

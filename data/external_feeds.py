@@ -101,7 +101,63 @@ def _lognormal_prob(current: float, strike: float, vol: float, hours: float, dir
 # ── Bitcoin Feed ──────────────────────────────────────────────────────────
 
 class CryptoFeed:
-    """BTC/ETH prices from CoinGecko (free, no key)."""
+    """BTC/ETH prices from CoinGecko, with Kraken as a redundant source.
+
+    Why redundancy: a single oracle is a single point of failure for the entire
+    crypto pricing stack. CoinGecko has been down for hours at a time. We fetch
+    from both, and use the median (or whichever side is alive) so a glitch on
+    one venue can't move our fair value.
+    """
+
+    SANITY_DEVIATION = 0.03  # cross-source disagreement > 3% logs a warning
+
+    @staticmethod
+    def _fetch_kraken_btc() -> float:
+        """Spot BTC/USD from Kraken public ticker. Returns 0 on failure."""
+        try:
+            data = _http_get_json("https://api.kraken.com/0/public/Ticker?pair=XBTUSD", timeout=8)
+            result = data.get("result", {})
+            if not result:
+                return 0.0
+            # Kraken returns a single key like "XXBTZUSD"
+            pair_key = next(iter(result))
+            last_trade = result[pair_key].get("c", [None])[0]
+            return float(last_trade) if last_trade else 0.0
+        except Exception as e:
+            logger.debug("Kraken BTC fetch failed: %s", e)
+            return 0.0
+
+    @classmethod
+    def _consensus_btc(cls, coingecko_price: float) -> tuple[float, list[str]]:
+        """Combine CoinGecko + Kraken into a single robust BTC price.
+
+        Returns (consensus_price, sources_used). The median of available sources
+        is used. If they disagree by more than SANITY_DEVIATION, log a warning
+        but still return the median (better than picking arbitrarily).
+        """
+        sources: list[tuple[str, float]] = []
+        if coingecko_price > 0:
+            sources.append(("coingecko", coingecko_price))
+        kraken_price = cls._fetch_kraken_btc()
+        if kraken_price > 0:
+            sources.append(("kraken", kraken_price))
+
+        if not sources:
+            return 0.0, []
+        if len(sources) == 1:
+            return sources[0][1], [sources[0][0]]
+
+        prices = sorted(p for _, p in sources)
+        median = prices[len(prices) // 2] if len(prices) % 2 == 1 else (prices[0] + prices[1]) / 2
+        spread = (max(prices) - min(prices)) / median if median > 0 else 0
+        if spread > cls.SANITY_DEVIATION:
+            logger.warning(
+                "BTC price source disagreement %.2f%% (%s) — using median %.0f",
+                spread * 100,
+                ", ".join(f"{s}={p:.0f}" for s, p in sources),
+                median,
+            )
+        return median, [s for s, _ in sources]
 
     def fetch(self) -> dict | None:
         """Get current BTC price + 30-day history for vol estimation."""
@@ -110,9 +166,12 @@ class CryptoFeed:
             price_data = _http_get_json(
                 "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin,ethereum&vs_currencies=usd&include_24hr_change=true"
             )
-            btc_price = price_data.get("bitcoin", {}).get("usd", 0)
+            cg_price = price_data.get("bitcoin", {}).get("usd", 0)
             btc_change = price_data.get("bitcoin", {}).get("usd_24h_change", 0)
             eth_price = price_data.get("ethereum", {}).get("usd", 0)
+
+            # Cross-check with Kraken; use median of available sources
+            btc_price, sources = self._consensus_btc(cg_price)
 
             # 30-day history for vol
             hist_data = _http_get_json(
@@ -133,19 +192,29 @@ class CryptoFeed:
                 "btc_24h_change": btc_change,
                 "eth_price": eth_price,
                 "btc_vol_annual": round(vol, 4),
+                "btc_sources": sources,
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             }
 
         return _cached_fetch("crypto", CACHE_TTL["crypto"], _fetch)
 
     def get_probability(self, strike: float, hours_to_expiry: float, direction: str = "above") -> dict:
-        """P(BTC > strike) or P(BTC < strike) at expiry."""
+        """P(BTC > strike) or P(BTC < strike) at expiry.
+
+        Routes to Heston for near-expiry contracts (< 48h) where stochastic
+        vol matters, lognormal otherwise.
+        """
         data = self.fetch()
         if not data or data["btc_price"] <= 0:
             return {"probability": 0.5, "source": "default", "stale": True}
 
-        prob = _lognormal_prob(data["btc_price"], strike, data["btc_vol_annual"], hours_to_expiry, direction)
+        from models.heston import heston_or_lognormal
+        prob, model = heston_or_lognormal(
+            data["btc_price"], strike, hours_to_expiry,
+            data["btc_vol_annual"], asset="btc", direction=direction,
+        )
 
+        sources = data.get("btc_sources", ["coingecko"])
         return {
             "probability": round(prob, 4),
             "current_price": data["btc_price"],
@@ -153,7 +222,8 @@ class CryptoFeed:
             "vol": data["btc_vol_annual"],
             "hours": hours_to_expiry,
             "direction": direction,
-            "source": "coingecko",
+            "source": "+".join(sources) if sources else "coingecko",
+            "model": model,
             "stale": False,
         }
 
@@ -190,12 +260,16 @@ class EquityFeed:
         return _cached_fetch("equity", CACHE_TTL["equity"], _fetch)
 
     def get_probability(self, strike: float, hours_to_expiry: float, direction: str = "above") -> dict:
-        """P(SPX > strike) at expiry."""
+        """P(SPX > strike) at expiry. Heston near expiry, lognormal otherwise."""
         data = self.fetch()
         if not data or data["spx"] <= 0:
             return {"probability": 0.5, "source": "default", "stale": True}
 
-        prob = _lognormal_prob(data["spx"], strike, data["spx_vol_annual"], hours_to_expiry, direction)
+        from models.heston import heston_or_lognormal
+        prob, model = heston_or_lognormal(
+            data["spx"], strike, hours_to_expiry,
+            data["spx_vol_annual"], asset="spx", direction=direction,
+        )
 
         return {
             "probability": round(prob, 4),
@@ -203,6 +277,7 @@ class EquityFeed:
             "strike": strike,
             "vol": data["spx_vol_annual"],
             "source": "yahoo_finance",
+            "model": model,
             "stale": False,
         }
 
@@ -297,6 +372,168 @@ class FedFundsFeed:
         }
 
 
+# ── CME FedWatch (ZQ Futures-Implied) ────────────────────────────────────
+
+class CMEFedWatchFeed:
+    """Fed Funds rate probabilities derived from 30-Day Fed Funds Futures (ZQ).
+
+    Why this exists
+    ---------------
+    The previous FedFundsFeed used hardcoded distance buckets ({0.40 for 25bps,
+    0.15 for 50bps...}). Those numbers are not market-implied — they're priors.
+    The CME FedWatch tool uses the same methodology this class implements:
+
+      1. The front-month ZQ futures price gives the market's expected average
+         effective fed funds rate over that month.
+      2. Implied avg = 100 - ZQ_price.
+      3. For an FOMC meeting on day d in a month with `dim` days:
+         implied_avg = ((d-1)/dim)*current + ((dim-d+1)/dim)*post_meeting_rate
+         Solve for post_meeting_rate (the market's expected rate AFTER the meeting).
+      4. The probability of a 25bp move = (post - current) / 25bps, treating the
+         distribution as a two-outcome (no-move vs +25bp) lottery. For larger
+         expected moves we extend the lattice symmetrically.
+
+    Data source
+    -----------
+    Yahoo Finance carries the front-month ZQ contract under the symbol "ZQ=F".
+    Free, no API key, used by countless other quant tools. We treat it as the
+    primary source and fall back to FRED's hardcoded rate if Yahoo is down.
+    """
+
+    # 2026 FOMC schedule (UTC dates of meeting decisions). Source: Federal Reserve.
+    # Update annually — these are public and don't change.
+    FOMC_DATES_2026 = (
+        "2026-01-28",
+        "2026-03-18",
+        "2026-04-29",
+        "2026-06-17",
+        "2026-07-29",
+        "2026-09-16",
+        "2026-10-28",
+        "2026-12-09",
+    )
+
+    def __init__(self):
+        # Cached current rate so the feed degrades gracefully if Yahoo blips
+        self._fred_fallback = FedFundsFeed()
+
+    def _next_fomc_date(self, today: datetime | None = None) -> datetime:
+        today = today or datetime.now(timezone.utc)
+        for d in self.FOMC_DATES_2026:
+            dt = datetime.fromisoformat(d).replace(tzinfo=timezone.utc)
+            if dt >= today:
+                return dt
+        # Past end of schedule — return last known
+        return datetime.fromisoformat(self.FOMC_DATES_2026[-1]).replace(tzinfo=timezone.utc)
+
+    @staticmethod
+    def _days_in_month(year: int, month: int) -> int:
+        if month == 12:
+            return 31
+        from datetime import date
+        next_month = date(year, month + 1, 1)
+        this_month = date(year, month, 1)
+        return (next_month - this_month).days
+
+    def _fetch_zq_price(self) -> float:
+        """Front-month ZQ contract price from Yahoo (returns 0 on failure)."""
+        try:
+            data = _http_get_json(
+                "https://query1.finance.yahoo.com/v8/finance/chart/ZQ%3DF?interval=1d&range=5d",
+                timeout=8,
+            )
+            meta = data.get("chart", {}).get("result", [{}])[0].get("meta", {})
+            return float(meta.get("regularMarketPrice", 0) or 0)
+        except Exception as e:
+            logger.debug("ZQ futures fetch failed: %s", e)
+            return 0.0
+
+    def fetch(self) -> dict | None:
+        def _fetch():
+            zq_price = self._fetch_zq_price()
+            current_data = self._fred_fallback.fetch() or {}
+            current_rate = current_data.get("target_rate_mid", 4.375)
+
+            if zq_price <= 0:
+                # Yahoo dead — fall back to FRED-only mode
+                return {
+                    "current_rate": current_rate,
+                    "implied_post_meeting_rate": current_rate,
+                    "implied_move_bps": 0,
+                    "next_fomc": self._next_fomc_date().isoformat(),
+                    "source": "fred_fallback",
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                }
+
+            implied_avg_rate = 100.0 - zq_price  # ZQ convention
+            fomc = self._next_fomc_date()
+            dim = self._days_in_month(fomc.year, fomc.month)
+            d = fomc.day  # day of meeting (1-indexed)
+            # Days BEFORE meeting in month at current rate, AFTER at post rate
+            n1 = d - 1
+            n2 = dim - n1
+            if n2 <= 0:
+                post_rate = implied_avg_rate
+            else:
+                post_rate = (implied_avg_rate * dim - n1 * current_rate) / n2
+
+            return {
+                "current_rate": current_rate,
+                "zq_price": zq_price,
+                "implied_avg_rate": round(implied_avg_rate, 4),
+                "implied_post_meeting_rate": round(post_rate, 4),
+                "implied_move_bps": round((post_rate - current_rate) * 100, 1),
+                "next_fomc": fomc.isoformat(),
+                "source": "cme_fedwatch_zq",
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }
+
+        return _cached_fetch("cme_fedwatch", CACHE_TTL["fed"], _fetch)
+
+    def get_probability(self, target_rate: float, hours_to_expiry: float, direction: str = "above") -> dict:
+        """P(post-FOMC rate >= target) using ZQ-implied distribution.
+
+        Method: assume the post-meeting rate is normally distributed around the
+        implied rate with std = 12.5bps (= half a 25bp tick, the historical
+        intraday vol of fed funds futures around FOMC). This is the same
+        distributional assumption Bloomberg's WIRP function uses.
+        """
+        data = self.fetch()
+        if not data:
+            return {"probability": 0.5, "source": "default", "stale": True}
+
+        implied = data["implied_post_meeting_rate"]
+        sigma = 0.125  # 12.5 bps in percent terms
+
+        # Standard normal CDF
+        def norm_cdf(x: float) -> float:
+            if x > 6:
+                return 1.0
+            if x < -6:
+                return 0.0
+            t = 1.0 / (1.0 + 0.2316419 * abs(x))
+            d_ = 0.3989423 * math.exp(-x * x / 2)
+            p = d_ * t * (0.3193815 + t * (-0.3565638 + t * (1.781478 + t * (-1.821256 + t * 1.330274))))
+            return 1.0 - p if x > 0 else p
+
+        z = (target_rate - implied) / sigma
+        prob_above = 1.0 - norm_cdf(z)
+        prob = prob_above if direction == "above" else 1.0 - prob_above
+        prob = max(0.01, min(0.99, prob))
+
+        return {
+            "probability": round(prob, 4),
+            "current_rate": data["current_rate"],
+            "implied_post_meeting_rate": implied,
+            "implied_move_bps": data.get("implied_move_bps", 0),
+            "target_rate": target_rate,
+            "next_fomc": data.get("next_fomc"),
+            "sigma_bps": int(sigma * 100),
+            "source": data.get("source", "cme_fedwatch_zq"),
+            "stale": data.get("source") == "fred_fallback",
+        }
+
+
 # ── Gas Price Feed ────────────────────────────────────────────────────────
 
 class GasPriceFeed:
@@ -368,7 +605,10 @@ class ExternalFeedManager:
     def __init__(self):
         self.crypto = CryptoFeed()
         self.equity = EquityFeed()
-        self.fed = FedFundsFeed()
+        # CME FedWatch (ZQ-derived) is the primary Fed source; FedFundsFeed is
+        # only a fallback if ZQ is unavailable.
+        self.fed = CMEFedWatchFeed()
+        self.fed_fallback = FedFundsFeed()
         self.gas = GasPriceFeed()
         self._last_refresh = {}
 

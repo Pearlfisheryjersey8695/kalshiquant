@@ -37,6 +37,7 @@ def create_router(
     alert_engine=None,
     quant_brain=None,
     parlay_pricer=None,
+    scheduler=None,
 ) -> APIRouter:
     router = APIRouter(prefix="/api")
 
@@ -510,6 +511,125 @@ def create_router(
             "feed_events": len(feed),
             "execution_engine": execution_engine.get_status() if execution_engine else None,
         }
+
+    @router.get("/decision/{ticker}")
+    async def integrated_decision(ticker: str, contracts: int = 100):
+        """End-to-end decision pipeline trace for a single market.
+
+        Demonstrates the full chain: live quote → calibrated fair value →
+        Polymarket cross-check → Black-Litterman sizing → CVaR projection →
+        decision. Returns the full DecisionTrace so you can see exactly which
+        gate (if any) rejected the trade and why.
+        """
+        market = state.get_market(ticker)
+        if not market:
+            raise HTTPException(404, f"Market {ticker} not found")
+
+        from data.external_feeds import feed_manager
+        from engine.integrated_decision import evaluate_market
+
+        live_quote = market.get("price", 0)
+        # The hours-to-expiry input for the external feeds
+        hours_to_expiry = 24 * 30  # default if we can't compute it
+        title = market.get("title", "")
+
+        # Get a raw fair value from external feeds (the live system uses the
+        # ensemble; this endpoint demonstrates the integration cleanly with
+        # whatever FV source is available).
+        try:
+            fv_dict = feed_manager.get_probability_for_ticker(ticker, live_quote, hours_to_expiry)
+            raw_fv = fv_dict.get("probability", live_quote) if fv_dict else live_quote
+        except Exception:
+            raw_fv = live_quote
+
+        loop = asyncio.get_running_loop()
+        trace = await loop.run_in_executor(
+            None,
+            lambda: evaluate_market(
+                ticker=ticker, live_quote=live_quote, raw_fair_value=raw_fv,
+                title=title, contracts=contracts,
+            ),
+        )
+        return trace.to_dict()
+
+    @router.get("/portfolio/optimize")
+    async def portfolio_optimize():
+        """Black-Litterman optimal weights for current signals.
+
+        Returns suggested portfolio weights respecting:
+          - View confidence (low-conf views shrunk toward zero)
+          - Cross-market correlation (correlated positions get less combined weight)
+          - Total leverage cap (default 60%)
+        """
+        from models.black_litterman import BlackLittermanOptimizer
+        bl = BlackLittermanOptimizer()
+        signals_data = signals_holder.get()
+        signals_list = signals_data.get("signals", [])
+        if not signals_list:
+            return {"weights": {}, "leverage": 0.0, "n_views": 0}
+        views = bl.views_from_signals(signals_list)
+        result = bl.optimize(views)
+        return {
+            "weights": result.weights,
+            "posterior_mu": result.posterior_mu,
+            "leverage": round(result.leverage, 4),
+            "n_views": result.n_views,
+        }
+
+    @router.get("/polymarket/arbs")
+    async def polymarket_arbs():
+        """Cross-venue arb scan: Kalshi vs Polymarket on currently tracked markets."""
+        from data.polymarket import polymarket_adapter
+        loop = asyncio.get_running_loop()
+        markets = state.get_all_markets()
+        # Run network call off the event loop
+        arbs = await loop.run_in_executor(None, polymarket_adapter.scan_arbs, markets)
+        return {
+            "n_scanned": len(markets),
+            "n_arbs": len(arbs),
+            "arbs": [
+                {
+                    "kalshi_ticker": a.kalshi_ticker,
+                    "kalshi_yes_price": a.kalshi_yes_price,
+                    "poly_market_id": a.poly_market_id,
+                    "poly_yes_price": a.poly_yes_price,
+                    "edge": a.edge,
+                    "confidence": a.confidence,
+                    "direction": a.arb_direction,
+                }
+                for a in arbs
+            ],
+        }
+
+    @router.get("/order-flow/{ticker}")
+    async def order_flow(ticker: str):
+        """VPIN + Kyle's lambda for a single ticker.
+
+        Returns 'low' / 'moderate' / 'high' toxicity label, plus the raw
+        VPIN and Kyle's λ for any client that wants to plot them.
+        """
+        from analysis.order_flow import order_flow_metrics
+        trades = state.get_recent_trades(ticker)
+        m = order_flow_metrics(trades)
+        return {
+            "ticker": ticker,
+            "vpin": m.vpin,
+            "kyle_lambda": m.kyle_lambda,
+            "n_trades": m.n_trades,
+            "n_buckets": m.n_buckets,
+            "avg_bucket_volume": m.avg_bucket_volume,
+            "toxicity_label": m.toxicity_label,
+        }
+
+    @router.get("/latency")
+    async def latency():
+        """Per-stage signal-loop latency (rolling p50/p95/max).
+
+        Stages: external_feeds, live_ensemble, batch_ensemble, parlay_pricer, execution.
+        """
+        if scheduler is None or not hasattr(scheduler, "latency"):
+            return {"error": "scheduler latency monitor unavailable"}
+        return scheduler.latency.stats()
 
     # ── Kalshi REST API Endpoints ─────────────────────────────────────────
 
@@ -1404,15 +1524,22 @@ def _compute_risk(signals_holder) -> dict:
             "ticker": s["ticker"],
             "contracts": s["recommended_contracts"],
             "current_price": s["current_price"],
+            "direction": s.get("direction", "BUY_YES"),
         }
         for s in signals_list
         if s.get("recommended_contracts", 0) > 0
     ]
 
-    var_95 = risk.portfolio_var(positions)
+    cvar_result = risk.portfolio_cvar(positions, seed=42)
+    stress_results = risk.stress_test(positions)
 
     return {
-        "var_95": var_95,
+        "var_95": cvar_result["var_95"],
+        "cvar_95": cvar_result["cvar_95"],
+        "worst_case": cvar_result["worst_case"],
+        "expected_pnl": cvar_result["expected_pnl"],
+        "n_sims": cvar_result["n_sims"],
+        "stress_scenarios": stress_results,
         "positions": positions,
     }
 

@@ -148,6 +148,19 @@ class KalshiClient:
     def get_all_markets(self, limit: int = 200, max_pages: int = 15) -> list:
         return self.paginate("/trade-api/v2/markets", "markets", {"limit": limit}, max_pages=max_pages)
 
+    def get_settled_markets(self, limit: int = 200, max_pages: int = 25) -> list:
+        """Fetch markets that have already settled (used for calibration backfill).
+
+        These markets have a known terminal outcome (`result` field) — perfect for
+        training the win-probability calibrator without having to wait for live
+        positions to close.
+        """
+        return self.paginate(
+            "/trade-api/v2/markets", "markets",
+            {"limit": limit, "status": "settled"},
+            max_pages=max_pages,
+        )
+
     def get_market(self, ticker: str):
         return self.get(f"/trade-api/v2/markets/{ticker}")
 

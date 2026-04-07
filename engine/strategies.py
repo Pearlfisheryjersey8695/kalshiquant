@@ -27,6 +27,12 @@ class StrategyConfig:
     max_hold_hours: float       # max time in position
     max_contracts: int          # per-position contract cap
     meta_gate: float            # minimum meta-model quality score
+    # Triple-barrier (López de Prado AFML ch.3) — opt-in per strategy.
+    # When True, the execution engine replaces fixed-pct stop/TP with
+    # vol-scaled barriers using pt_sigma_mult / sl_sigma_mult.
+    use_triple_barrier: bool = False
+    pt_sigma_mult: float = 2.0   # take-profit barrier in sigma units
+    sl_sigma_mult: float = 1.0   # stop-loss barrier in sigma units
 
 
 STRATEGIES: dict[str, StrategyConfig] = {
@@ -51,6 +57,11 @@ STRATEGIES: dict[str, StrategyConfig] = {
         max_hold_hours=2.0,
         max_contracts=300,
         meta_gate=0.40,
+        # Trending markets need wider stops in high-vol regimes; vol-scaled
+        # barriers handle this automatically.
+        use_triple_barrier=True,
+        pt_sigma_mult=2.5,
+        sl_sigma_mult=1.0,
     ),
     "mean_reversion": StrategyConfig(
         name="mean_reversion",
@@ -62,6 +73,11 @@ STRATEGIES: dict[str, StrategyConfig] = {
         max_hold_hours=6.0,
         max_contracts=400,
         meta_gate=0.20,
+        # Mean-reversion benefits most from σ-scaling: wide stop on volatile
+        # markets prevents premature exit before reversion completes.
+        use_triple_barrier=True,
+        pt_sigma_mult=1.5,
+        sl_sigma_mult=1.5,
     ),
     "event_driven": StrategyConfig(
         name="event_driven",

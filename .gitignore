@@ -23,6 +23,9 @@ signals/*.json
 models/saved/*.json
 models/saved/*.pkl
 !models/saved/.gitkeep
+# Keep the fitted calibration curve as a research artifact (no secrets, just
+# the isotonic curve coefficients fitted on public Kalshi settlement data)
+!models/saved/win_prob_calibration.json
 
 # Node
 dashboard/node_modules/
@@ -41,3 +44,11 @@ data/last_refresh.json
 data/strategies.db
 data/api_audit.json
 data/liquidity_report.json
+
+# Runtime logs (server output, debug traces) — never commit these
+logs/
+*.log
+
+# Jupyter notebook checkpoints
+.ipynb_checkpoints/
+notebooks/.ipynb_checkpoints/

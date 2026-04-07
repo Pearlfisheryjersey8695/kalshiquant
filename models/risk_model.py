@@ -9,111 +9,187 @@ Step 2.5 -- Risk Model & Position Sizing
 """
 
 import json
+import logging
 import math
 import os
+import sqlite3
 
 import numpy as np
 import pandas as pd
+from sklearn.isotonic import IsotonicRegression
+
 from models.base import BaseModel, registry
+
+logger = logging.getLogger(__name__)
+
+
+def _default_calibration_path() -> str:
+    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(project_root, "models", "saved", "win_prob_calibration.json")
+
+
+def _project_root() -> str:
+    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 class WinProbCalibrator:
     """Isotonic regression calibrator: confidence -> actual win probability.
-    Trained on OOS backtest data. Falls back to linear if no calibration data.
+
+    Uses sklearn IsotonicRegression (PAV algorithm) which is the gold-standard
+    nonparametric monotonic fit. Trained on closed positions and backtest trades.
+    Falls back to a conservative linear mapping if no calibration data is available.
+
+    The fitted curve is stored as (x_grid, y_grid) so it can round-trip through JSON
+    without pickling sklearn objects.
     """
 
+    MIN_TRAINING_SAMPLES = 10
+    MIN_PER_CLASS = 3  # need at least this many winners AND losers to trust the fit
+
     def __init__(self):
-        self._bins: list[tuple[float, float]] = []  # (confidence_threshold, empirical_win_rate)
-        self._is_fitted = False
+        self._x_grid: list[float] = []
+        self._y_grid: list[float] = []
+        self._n_train: int = 0
+        self._is_fitted: bool = False
 
-    def fit_from_backtest(self, backtest_path: str = None):
-        """Load backtest results and build calibration curve."""
+    # ── Training data sources ────────────────────────────────────
+    @staticmethod
+    def _confidence_from_edge(edge: float) -> float:
+        """Reconstruct ensemble confidence from edge magnitude.
+        Mirrors the formula used in the signal ensemble.
+        """
+        return min(abs(edge) / 0.10, 1.0) * 0.5 + 0.2
+
+    @classmethod
+    def _load_backtest_pairs(cls, backtest_path: str = None) -> list[tuple[float, float]]:
         if backtest_path is None:
-            project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-            backtest_path = os.path.join(project_root, "signals", "backtest_results.json")
-
+            backtest_path = os.path.join(_project_root(), "signals", "backtest_results.json")
         try:
             with open(backtest_path) as f:
                 data = json.load(f)
         except (FileNotFoundError, json.JSONDecodeError):
-            return
-
-        trades = data.get("trades", [])
-        if len(trades) < 10:
-            return
-
-        # Build (confidence, is_winner) pairs
+            return []
         pairs = []
-        for t in trades:
-            # Estimate confidence from edge magnitude (same formula as ensemble)
-            edge = abs(t.get("edge_at_entry", 0))
-            conf = min(edge / 0.10, 1.0) * 0.5 + 0.2  # rough reconstruction
-            is_winner = 1.0 if t.get("net_pnl", t.get("pnl", 0)) > 0 else 0.0
-            pairs.append((conf, is_winner))
+        for t in data.get("trades", []):
+            conf = cls._confidence_from_edge(t.get("edge_at_entry", 0))
+            net = t.get("net_pnl", t.get("pnl", 0))
+            pairs.append((conf, 1.0 if net > 0 else 0.0))
+        return pairs
 
-        pairs.sort(key=lambda x: x[0])
+    @classmethod
+    def _load_position_pairs(cls, db_path: str = None) -> list[tuple[float, float]]:
+        if db_path is None:
+            db_path = os.path.join(_project_root(), "data", "positions.db")
+        if not os.path.exists(db_path):
+            return []
+        try:
+            conn = sqlite3.connect(db_path)
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT confidence_at_entry, edge_at_entry, realized_pnl "
+                "FROM positions WHERE status='closed'"
+            )
+            rows = cur.fetchall()
+            conn.close()
+        except sqlite3.Error as e:
+            logger.warning("Could not read positions DB: %s", e)
+            return []
+        pairs = []
+        for conf, edge, pnl in rows:
+            # Prefer the recorded confidence; fall back to edge-derived
+            if conf is None or conf <= 0:
+                conf = cls._confidence_from_edge(edge or 0)
+            pairs.append((float(conf), 1.0 if (pnl or 0) > 0 else 0.0))
+        return pairs
 
-        # Build calibration bins (5 quantile bins)
-        n = len(pairs)
-        n_bins = min(5, n // 3)
-        if n_bins < 2:
-            return
+    def fit_from_history(self) -> int:
+        """Train on the union of backtest trades and closed live positions.
 
-        bin_size = n // n_bins
-        self._bins = []
-        for i in range(n_bins):
-            start = i * bin_size
-            end = start + bin_size if i < n_bins - 1 else n
-            bin_confs = [p[0] for p in pairs[start:end]]
-            bin_wins = [p[1] for p in pairs[start:end]]
-            threshold = sum(bin_confs) / len(bin_confs)
-            win_rate = sum(bin_wins) / len(bin_wins)
-            self._bins.append((threshold, win_rate))
+        Returns the number of training samples used (0 if too few to fit).
+        """
+        pairs = self._load_position_pairs() + self._load_backtest_pairs()
+        if len(pairs) < self.MIN_TRAINING_SAMPLES:
+            logger.info(
+                "WinProbCalibrator: only %d samples (need %d) — keeping fallback",
+                len(pairs), self.MIN_TRAINING_SAMPLES,
+            )
+            return 0
 
+        n_wins = sum(1 for _, y in pairs if y > 0.5)
+        n_losses = len(pairs) - n_wins
+        if n_wins < self.MIN_PER_CLASS or n_losses < self.MIN_PER_CLASS:
+            # Degenerate sample (e.g. all losers in 15-trade backtest) — refusing
+            # to fit prevents the calibrator from clamping every prediction to its
+            # y_min/y_max floor and blocking all future trades.
+            logger.warning(
+                "WinProbCalibrator: degenerate sample (wins=%d losses=%d, need >=%d each) — keeping fallback",
+                n_wins, n_losses, self.MIN_PER_CLASS,
+            )
+            return 0
+
+        x = np.array([p[0] for p in pairs], dtype=float)
+        y = np.array([p[1] for p in pairs], dtype=float)
+
+        # Clip the predicted probability range so the calibrator can never
+        # output 0 or 1 (those would imply infinite Kelly bets).
+        iso = IsotonicRegression(y_min=0.05, y_max=0.95, out_of_bounds="clip")
+        iso.fit(x, y)
+
+        # Materialise the curve on a fine grid so it survives JSON round-trip
+        grid = np.linspace(0.0, 1.0, 51)
+        self._x_grid = grid.tolist()
+        self._y_grid = iso.predict(grid).tolist()
+        self._n_train = len(pairs)
         self._is_fitted = True
+        logger.info("WinProbCalibrator fitted on %d samples", self._n_train)
+        return self._n_train
 
+    # Backwards-compatible alias
+    def fit_from_backtest(self, backtest_path: str = None):
+        return self.fit_from_history()
+
+    # ── Prediction ───────────────────────────────────────────────
     def calibrate(self, confidence: float) -> float:
         """Map raw confidence to calibrated win probability."""
-        if not self._is_fitted or not self._bins:
-            # Fallback: conservative linear mapping
-            return 0.5 + confidence * 0.15
+        if not self._is_fitted or not self._x_grid:
+            # Fallback: conservative linear mapping (max win_prob = 0.65)
+            return 0.5 + max(0.0, min(1.0, confidence)) * 0.15
+        c = max(0.0, min(1.0, confidence))
+        return float(np.interp(c, self._x_grid, self._y_grid))
 
-        # Interpolate between bins
-        if confidence <= self._bins[0][0]:
-            return self._bins[0][1]
-        if confidence >= self._bins[-1][0]:
-            return self._bins[-1][1]
-
-        for i in range(len(self._bins) - 1):
-            c0, w0 = self._bins[i]
-            c1, w1 = self._bins[i + 1]
-            if c0 <= confidence <= c1:
-                t = (confidence - c0) / (c1 - c0) if c1 != c0 else 0
-                return w0 + t * (w1 - w0)
-
-        return self._bins[-1][1]
-
+    # ── Persistence ──────────────────────────────────────────────
     def save(self, path: str = None):
-        """Save calibration curve to JSON."""
         if path is None:
-            project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-            path = os.path.join(project_root, "models", "saved", "win_prob_calibration.json")
+            path = _default_calibration_path()
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "w") as f:
-            json.dump({"bins": self._bins, "is_fitted": self._is_fitted}, f)
+            json.dump({
+                "x_grid": self._x_grid,
+                "y_grid": self._y_grid,
+                "n_train": self._n_train,
+                "is_fitted": self._is_fitted,
+            }, f)
 
     def load(self, path: str = None):
-        """Load calibration curve from JSON."""
         if path is None:
-            project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-            path = os.path.join(project_root, "models", "saved", "win_prob_calibration.json")
+            path = _default_calibration_path()
         try:
             with open(path) as f:
                 data = json.load(f)
-            self._bins = [tuple(b) for b in data.get("bins", [])]
-            self._is_fitted = data.get("is_fitted", False)
+            self._x_grid = list(data.get("x_grid", []))
+            self._y_grid = list(data.get("y_grid", []))
+            self._n_train = int(data.get("n_train", 0))
+            self._is_fitted = bool(data.get("is_fitted", False))
         except (FileNotFoundError, json.JSONDecodeError):
             pass
+
+    def info(self) -> dict:
+        return {
+            "is_fitted": self._is_fitted,
+            "n_train": self._n_train,
+            "min_calibrated": min(self._y_grid) if self._y_grid else None,
+            "max_calibrated": max(self._y_grid) if self._y_grid else None,
+        }
 
 
 def kalshi_fee(price: float) -> float:
@@ -164,8 +240,14 @@ class RiskModel(BaseModel):
         self._correlations = {}
         self._var_estimates = {}
         self._calibrator = WinProbCalibrator()
-        # Try to load saved calibration
+        # Try to load saved calibration; if missing, attempt to fit from history
         self._calibrator.load()
+        if not self._calibrator._is_fitted:
+            try:
+                if self._calibrator.fit_from_history() > 0:
+                    self._calibrator.save()
+            except Exception as e:  # pragma: no cover - defensive
+                logger.warning("Calibrator auto-fit failed: %s", e)
 
     def fit(self, data: pd.DataFrame):
         """Compute cross-market correlations and volatility for VaR."""
@@ -323,54 +405,191 @@ class RiskModel(BaseModel):
         return contracts, details
 
     def portfolio_var(self, positions):
+        """95% portfolio Value-at-Risk in dollars (positive = loss).
+
+        Backed by the Monte Carlo Bernoulli simulator in portfolio_cvar() so the
+        number is internally consistent with CVaR. Kept as a thin wrapper for
+        existing callers (alerts, dashboard tiles).
         """
-        Correlation-adjusted Value at Risk for a portfolio of positions.
-        positions: [{ticker, contracts, current_price}, ...]
+        return self.portfolio_cvar(positions).get("var_95", 0.0)
+
+    # ── CVaR / Expected Shortfall ────────────────────────────────────────
+    #
+    # Why this exists:
+    #   Parametric VaR with a Gaussian assumption is wrong for binary contracts —
+    #   a Kalshi YES at 30c is Bernoulli(0.30), not Normal. The terminal payoff is
+    #   bimodal (0 or 1), so Gaussian VaR underestimates tail loss. CVaR via Monte
+    #   Carlo on the actual Bernoulli distribution captures the real tail.
+    #
+    # Method:
+    #   1. For each position, model terminal payoff as Bernoulli(p = current_price).
+    #   2. Inject correlation via a Gaussian copula on the latent normal variables
+    #      (correlated u_i -> threshold at Phi^-1(p_i) -> correlated outcomes).
+    #   3. Compute P&L per simulation, take the 5% tail mean.
+    #
+    # Output is conservative because Bernoulli at terminal is the *worst-case*
+    # interpretation. For mid-life mark-to-market risk you'd add a vol-of-price
+    # term, but for Kalshi's hold-to-expiry binaries this is the right primitive.
+
+    CVAR_ALPHA = 0.05       # 95% CVaR
+    CVAR_SIMS = 10_000      # Monte Carlo paths
+
+    def portfolio_cvar(self, positions, n_sims: int = None, seed: int = None) -> dict:
+        """Monte Carlo CVaR / Expected Shortfall for a portfolio of binary contracts.
+
+        Returns a dict with var_95, cvar_95, worst_case, expected_pnl, n_sims.
+        Compatible with the existing portfolio_var() consumer — that key is still
+        present and now sourced from the simulation.
         """
         if not positions:
-            return 0
+            return {
+                "var_95": 0.0, "cvar_95": 0.0, "worst_case": 0.0,
+                "expected_pnl": 0.0, "n_sims": 0,
+            }
 
-        values = []
-        vols = []
-        for pos in positions:
-            t = pos["ticker"]
-            direction = pos.get("direction", "BUY_YES")
-            if direction == "BUY_NO":
-                val = pos["contracts"] * (1 - pos["current_price"])
-            else:
-                val = pos["contracts"] * pos["current_price"]
-            values.append(val)
-            var_info = self._var_estimates.get(t, {})
-            vols.append(var_info.get("daily_vol", 0.02))
+        n_sims = n_sims or self.CVAR_SIMS
+        rng = np.random.default_rng(seed)
 
-        values = np.array(values)
-        vols = np.array(vols)
-        n = len(values)
+        # Build per-position arrays
+        n = len(positions)
+        contracts = np.array([p["contracts"] for p in positions], dtype=float)
+        prices = np.array([p["current_price"] for p in positions], dtype=float)
+        # Clip away from {0, 1} so the inverse normal is finite
+        prices = np.clip(prices, 1e-4, 1 - 1e-4)
 
-        # Build correlation matrix
-        corr_matrix = np.eye(n)
+        # Direction: BUY_YES pays 1.0 if YES wins; BUY_NO pays 1.0 if NO wins.
+        is_yes = np.array([
+            p.get("direction", "BUY_YES") == "BUY_YES" for p in positions
+        ], dtype=bool)
+        # Cost basis (entry assumed at current_price for risk purposes)
+        cost = np.where(is_yes, prices, 1 - prices) * contracts
+
+        # Build correlation matrix on the latent Gaussian
+        corr = np.eye(n)
         tickers = [p["ticker"] for p in positions]
         for i in range(n):
-            for j in range(i+1, n):
+            for j in range(i + 1, n):
                 key = (tickers[i], tickers[j])
-                rev_key = (tickers[j], tickers[i])
-                c = self._correlations.get(key, self._correlations.get(rev_key, 0.0))
-                corr_matrix[i, j] = c
-                corr_matrix[j, i] = c
+                rev = (tickers[j], tickers[i])
+                c = self._correlations.get(key, self._correlations.get(rev, 0.0))
+                # Clip to keep matrix PSD-friendly
+                c = max(-0.95, min(0.95, c))
+                corr[i, j] = c
+                corr[j, i] = c
 
-        # Note: Parametric VaR with normal assumption underestimates tail risk
-        # for binary contracts bounded in [0,1]. We add a binary jump risk premium
-        # to account for potential settlement at 0 or 1.
-        # Portfolio VaR (parametric, 95%)
-        weights = values / values.sum() if values.sum() > 0 else np.ones(n) / n
-        port_vol = np.sqrt(weights @ (np.diag(vols) @ corr_matrix @ np.diag(vols)) @ weights)
-        binary_jump_risk = sum(
-            pos["contracts"] * min(pos["current_price"], 1 - pos["current_price"])
-            for pos in positions
-        ) * 0.10  # 10% probability of jump-to-boundary
-        var_95 = values.sum() * port_vol * 1.645 + binary_jump_risk
+        # Cholesky for correlated normals; fall back to identity if not PSD
+        try:
+            L = np.linalg.cholesky(corr + 1e-8 * np.eye(n))
+        except np.linalg.LinAlgError:
+            L = np.eye(n)
 
-        return round(var_95, 2)
+        # Sample correlated standard normals -> uniforms via Phi -> Bernoulli outcomes
+        z = rng.standard_normal(size=(n_sims, n)) @ L.T
+        # Phi(z): standard normal CDF
+        from math import erf, sqrt as _sqrt
+        u = 0.5 * (1.0 + np.vectorize(lambda x: erf(x / _sqrt(2.0)))(z))
+
+        # YES wins iff u < p_yes; NO wins iff u >= p_yes (i.e. YES loses)
+        yes_wins = u < prices  # shape (n_sims, n)
+        # Payoff per position per sim: contracts * 1 if our side wins, 0 otherwise
+        our_side_wins = np.where(is_yes[None, :], yes_wins, ~yes_wins)
+        gross_payoff = our_side_wins.astype(float) * contracts  # (n_sims, n)
+
+        # P&L per sim = total payoff - total cost basis
+        pnl = gross_payoff.sum(axis=1) - cost.sum()
+
+        # VaR at 5th percentile (loss is negative -> percentile of pnl)
+        var_threshold = float(np.percentile(pnl, self.CVAR_ALPHA * 100))
+        # CVaR = mean of P&L below VaR threshold
+        tail_mask = pnl <= var_threshold
+        cvar_value = float(pnl[tail_mask].mean()) if tail_mask.any() else var_threshold
+
+        return {
+            "var_95": round(-var_threshold, 2),       # report as positive loss
+            "cvar_95": round(-cvar_value, 2),         # report as positive loss
+            "worst_case": round(-float(pnl.min()), 2),
+            "expected_pnl": round(float(pnl.mean()), 2),
+            "n_sims": n_sims,
+        }
+
+    # ── Stress scenarios ──────────────────────────────────────────────────
+    #
+    # The 5 scenarios below are the ones that actually matter for a prediction
+    # market book. Each takes the current portfolio and computes the P&L assuming
+    # the scenario's "world" is realised — categorical positions get crushed,
+    # uncorrelated positions are untouched.
+
+    STRESS_SCENARIOS: dict[str, dict] = {
+        "crypto_crash": {
+            "description": "BTC -20% in 24h: all crypto YES positions worth 0, NO positions worth 1",
+            "category_match": ("crypto", "btc", "eth", "kxbtc", "kxeth"),
+            "yes_outcome": 0.0,  # BTC settled NO
+        },
+        "fed_surprise_hike": {
+            "description": "FOMC surprise +50bps: all 'hold' or 'cut' YES positions worth 0",
+            "category_match": ("fed", "fomc", "rate", "kxfed"),
+            "yes_outcome": 0.0,
+        },
+        "spx_gap_down": {
+            "description": "SPX -5% gap: all 'above' equity YES positions worth 0",
+            "category_match": ("spx", "sp500", "kxinx", "kxspx", "equity"),
+            "yes_outcome": 0.0,
+        },
+        "vol_spike": {
+            "description": "VIX 2x: vol-sensitive positions mark to 50% of cost basis",
+            "category_match": ("vix", "vol"),
+            "yes_outcome": None,  # not settlement, mark-to-market only
+            "mtm_haircut": 0.50,
+        },
+        "liquidity_shock": {
+            "description": "Exit at 50% of mid: every open position takes 50% slippage on close",
+            "category_match": None,  # applies to all positions
+            "yes_outcome": None,
+            "mtm_haircut": 0.50,
+        },
+    }
+
+    def stress_test(self, positions) -> dict:
+        """Run all 5 stress scenarios against the current book.
+
+        Returns {scenario_name: {pnl, n_hit, description}}.
+        """
+        results = {}
+        for name, spec in self.STRESS_SCENARIOS.items():
+            pnl_total = 0.0
+            n_hit = 0
+            for pos in positions:
+                ticker = pos.get("ticker", "").lower()
+                contracts = pos["contracts"]
+                price = pos["current_price"]
+                direction = pos.get("direction", "BUY_YES")
+                cost = contracts * (price if direction == "BUY_YES" else 1 - price)
+
+                # Match position against scenario category
+                if spec["category_match"] is not None:
+                    if not any(tag in ticker for tag in spec["category_match"]):
+                        continue
+                n_hit += 1
+
+                if spec["yes_outcome"] is not None:
+                    # Settlement scenario: terminal payoff
+                    yes_pays = spec["yes_outcome"] * contracts
+                    if direction == "BUY_YES":
+                        payoff = yes_pays
+                    else:
+                        payoff = (1 - spec["yes_outcome"]) * contracts
+                    pnl_total += payoff - cost
+                else:
+                    # Mark-to-market haircut scenario
+                    haircut = spec["mtm_haircut"]
+                    pnl_total += -cost * haircut
+
+            results[name] = {
+                "description": spec["description"],
+                "pnl": round(pnl_total, 2),
+                "n_positions_hit": n_hit,
+            }
+        return results
 
     def suggest_hedges(self, ticker, direction):
         """Find correlated markets that could serve as hedges."""

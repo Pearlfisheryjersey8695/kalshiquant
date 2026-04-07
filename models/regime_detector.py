@@ -56,9 +56,16 @@ class RegimeDetector(BaseModel):
         # 2. Realized volatility
         realized_vol = np.clip(vol, 0, 1)
 
-        # 3. Volume ratio (current / rolling mean)
-        vol_mean = pd.Series(volume).rolling(12, min_periods=1).mean().values
-        volume_ratio = np.where(vol_mean > 0, volume / vol_mean, 1.0)
+        # 3. Volume ratio (current / rolling mean of PRIOR bars only)
+        # .shift(1) prevents the current bar from contributing to its own baseline.
+        vol_mean = pd.Series(volume).rolling(12, min_periods=1).mean().shift(1).fillna(0).values
+        # Avoid divide-by-zero noise on the first bar (where shift(1) leaves a zero):
+        # use np.divide with where= to skip degenerate denominators entirely.
+        volume_ratio = np.divide(
+            volume, vol_mean,
+            out=np.ones_like(volume, dtype=float),
+            where=vol_mean > 0,
+        )
         volume_ratio = np.clip(volume_ratio, 0, 10)
 
         # 4. Spread: abs(zscore) as distance-from-mean proxy

@@ -76,6 +76,11 @@ class PortfolioResponse(BaseModel):
 
 class RiskResponse(BaseModel):
     var_95: float
+    cvar_95: float = 0.0
+    worst_case: float = 0.0
+    expected_pnl: float = 0.0
+    n_sims: int = 0
+    stress_scenarios: dict = {}
     positions: list[dict] = []
 
 

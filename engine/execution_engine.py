@@ -17,6 +17,7 @@ from engine.market_state import MarketStateStore
 from engine.orderbook import OrderbookStore
 from engine.position_manager import PositionManager
 from engine.strategies import get_strategy, StrategyConfig
+from engine.triple_barrier import TripleBarrier, BarrierTouch, realized_vol_from_prices
 from models.risk_model import RiskModel
 
 logger = logging.getLogger("kalshi.execution")
@@ -195,6 +196,21 @@ class ExecutionEngine:
             self._log_skip(ticker, f"slippage={slippage:.4f} > {MAX_SLIPPAGE_RATIO}*net_edge={net_edge:.4f}")
             return {"pass": False, "reason": "slippage too high"}
 
+        # i.5) order flow toxicity gate (VPIN)
+        # If recent flow on this ticker looks heavily one-sided, we're likely
+        # trading INTO informed flow — skip the entry. This is the cheapest
+        # adverse-selection gate that exists.
+        try:
+            from analysis.order_flow import order_flow_metrics, is_toxic
+            recent_trades = self.state.get_recent_trades(ticker)
+            if len(recent_trades) >= 20:  # need enough tape for VPIN to be meaningful
+                of = order_flow_metrics(recent_trades)
+                if is_toxic(of, vpin_threshold=0.55):
+                    self._log_skip(ticker, f"toxic flow VPIN={of.vpin:.2f} (>0.55)")
+                    return {"pass": False, "reason": f"toxic flow (VPIN={of.vpin:.2f})"}
+        except Exception as e:
+            logger.debug("VPIN gate failed for %s: %s", ticker, e)
+
         # ── Trade sizing math ───────────────────────────────────────────────
         # net_edge already has fees subtracted, so don't subtract again
         expected_profit = net_edge * contracts
@@ -342,6 +358,29 @@ class ExecutionEngine:
         take_profit_partial = take_profit_ratio * 0.75  # partial at 75% of full TP
         max_hold_hours = strat.max_hold_hours
 
+        # ── Triple-barrier path (López de Prado AFML ch.3) ──────────────
+        # Replaces fixed stop/TP with vol-scaled barriers when the strategy
+        # opts in. The vertical barrier enforces max_hold_hours.
+        use_tb = getattr(strat, "use_triple_barrier", False)
+        if use_tb:
+            history = self.state.get_history(ticker, limit=60)
+            prices = [h.get("price", 0) for h in history if h.get("price", 0) > 0]
+            sigma = realized_vol_from_prices(prices)
+            tb = TripleBarrier(
+                entry_price=entry_price,
+                sigma=sigma,
+                pt_mult=strat.pt_sigma_mult,
+                sl_mult=strat.sl_sigma_mult,
+                max_hold_minutes=max_hold_hours * 60,
+                direction=direction,
+            )
+            elapsed = pos._hold_time_minutes()
+            touch = tb.check_touch(current_price, elapsed)
+            if touch != BarrierTouch.NONE:
+                return {"reason": tb.reason_string(touch)}
+            # No barrier touched — skip legacy stop/TP/time, but still run
+            # edge-decay / regime / expiry checks below.
+
         # ── a) STOP-LOSS: strategy-specific loss threshold ──────────────
         if direction == "BUY_YES":
             pnl_pct = (current_price - entry_price) / entry_price if entry_price > 0 else 0
@@ -349,7 +388,7 @@ class ExecutionEngine:
             cost = 1.0 - entry_price
             pnl_pct = (entry_price - current_price) / cost if cost > 0 else 0
 
-        if pnl_pct < -stop_loss_pct:
+        if not use_tb and pnl_pct < -stop_loss_pct:
             return {"reason": "STOP_LOSS"}
 
         # ── b) TAKE-PROFIT: strategy-specific reward:risk ───────────────
@@ -366,7 +405,7 @@ class ExecutionEngine:
 
         risk_amount = max(stop_distance, 0.01)
 
-        if gain > 0 and risk_amount > 0:
+        if not use_tb and gain > 0 and risk_amount > 0:
             reward_risk = gain / risk_amount
 
             if reward_risk >= take_profit_ratio:
@@ -394,9 +433,11 @@ class ExecutionEngine:
                     return {"reason": f"REGIME_CHANGE ({pos.regime_at_entry}->{current_regime})"}
 
         # ── e) TIME DECAY: strategy-specific max hold ───────────────────
-        hold_minutes = pos._hold_time_minutes()
-        if hold_minutes > max_hold_hours * 60:
-            return {"reason": f"TIME_DECAY ({hold_minutes / 60:.1f}h)"}
+        # Skip when triple-barrier owns the time barrier (vertical).
+        if not use_tb:
+            hold_minutes = pos._hold_time_minutes()
+            if hold_minutes > max_hold_hours * 60:
+                return {"reason": f"TIME_DECAY ({hold_minutes / 60:.1f}h)"}
 
         # ── f) EXPIRY PROXIMITY: < 1 hour to expiry ────────────────────
         market = self.state.get_market(ticker)

@@ -19,6 +19,7 @@ import time
 from datetime import datetime, timezone
 
 from engine.feed import FeedLog, FeedEventType
+from engine.latency_monitor import LatencyMonitor
 from engine.market_state import MarketStateStore
 from engine.orderbook import OrderbookStore
 
@@ -54,6 +55,7 @@ class Scheduler:
         self._alert_engine = alert_engine
         self._tasks: list[asyncio.Task] = []
         self._signal_lock = asyncio.Lock()  # prevent concurrent runs
+        self.latency = LatencyMonitor(window=50)
 
         # Live model manager (initialized lazily in executor)
         self._model_mgr = None
@@ -253,14 +255,15 @@ class Scheduler:
 
         async with self._signal_lock:
             # Refresh external data feeds before signal computation
-            try:
-                from data.external_feeds import feed_manager
-                loop_ext = asyncio.get_running_loop()
-                ext_data = await loop_ext.run_in_executor(None, feed_manager.get_all_current_data)
-                if ext_data:
-                    logger.debug("External feeds refreshed: %s", list(ext_data.keys()))
-            except Exception as e:
-                logger.warning("External feed refresh failed: %s", e)
+            with self.latency.stage("external_feeds"):
+                try:
+                    from data.external_feeds import feed_manager
+                    loop_ext = asyncio.get_running_loop()
+                    ext_data = await loop_ext.run_in_executor(None, feed_manager.get_all_current_data)
+                    if ext_data:
+                        logger.debug("External feeds refreshed: %s", list(ext_data.keys()))
+                except Exception as e:
+                    logger.warning("External feed refresh failed: %s", e)
 
             loop = asyncio.get_running_loop()
             result = None
@@ -269,9 +272,10 @@ class Scheduler:
             # ── Try 1: Live feature pipeline ──────────────────────────
             if self._model_mgr and self._model_mgr.is_fitted:
                 try:
-                    result = await loop.run_in_executor(
-                        None, self._run_live_ensemble_sync
-                    )
+                    with self.latency.stage("live_ensemble"):
+                        result = await loop.run_in_executor(
+                            None, self._run_live_ensemble_sync
+                        )
                     if result and result.get("signals"):
                         source = "live"
                         logger.info(
@@ -292,9 +296,10 @@ class Scheduler:
             # ── Try 2: Batch fallback ──────────────────────────────────
             if not result or not result.get("signals"):
                 try:
-                    result = await loop.run_in_executor(
-                        None, self._run_batch_ensemble_sync
-                    )
+                    with self.latency.stage("batch_ensemble"):
+                        result = await loop.run_in_executor(
+                            None, self._run_batch_ensemble_sync
+                        )
                     if result and result.get("signals"):
                         source = "batch"
                         self._overlay_live_prices(result)
@@ -328,9 +333,10 @@ class Scheduler:
                 if hasattr(self, '_parlay_pricer') and self._parlay_pricer:
                     try:
                         loop = asyncio.get_running_loop()
-                        parlay_signals = await loop.run_in_executor(
-                            None, self._parlay_pricer.generate_signals, self._state
-                        )
+                        with self.latency.stage("parlay_pricer"):
+                            parlay_signals = await loop.run_in_executor(
+                                None, self._parlay_pricer.generate_signals, self._state
+                            )
                         if parlay_signals:
                             existing_tickers = {s["ticker"] for s in result["signals"]}
                             new_parlays = [s for s in parlay_signals if s["ticker"] not in existing_tickers]
@@ -368,6 +374,7 @@ class Scheduler:
                 exits_count = 0
                 if self._execution_engine and self._position_manager:
                     try:
+                      with self.latency.stage("execution"):
                         signals_list = result.get("signals", [])
 
                         # If QuantBrain is active, it handles entries (but we still need exits)
@@ -411,6 +418,17 @@ class Scheduler:
                     source.upper(),
                     result.get("total_signals", 0),
                     result.get("generated_at", ""),
+                )
+
+            # Roll latency timings into rolling windows (always, even on early return)
+            cycle_ms = self.latency.complete_cycle()
+            if cycle_ms:
+                logger.info(
+                    "Latency: total=%.0fms %s",
+                    cycle_ms.get("__total__", 0) * 1000,
+                    " ".join(
+                        f"{k}={int(v*1000)}ms" for k, v in cycle_ms.items() if k != "__total__"
+                    ),
                 )
 
     def _run_live_ensemble_sync(self) -> dict:
